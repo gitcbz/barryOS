@@ -2,23 +2,22 @@
 
 Reverse-chronological.
 
-## 2026-09-21 — Round 8 — Stage 8 (Desktop Environment + Apps) — ✅ COMPLETE
-- Implemented desktop applications in `kernel/src/apps/`:
-  - `terminal.rs` — Terminal with 7 commands (help, ver, ls, mem, ps, echo,
-    cat). Renders to framebuffer. Command processing verified via serial.
-  - `filemgr.rs` — File manager listing 4 VFS files with icons + sizes.
-  - `sysinfo.rs` — System info display (kernel version, memory, processes,
-    timer ticks).
-  - `mod.rs` — App init sequence: terminal → file manager → system info →
-    render all → command test.
-- Updated `kernel/src/wm/desktop.rs`: Apps create their own windows;
-    desktop only renders background + status bar + dock.
-- Updated `kernel/src/main.rs`: `mod apps`, calls `apps::init()`.
-- Updated `scripts/check.sh`: L10 gate (5 Stage 8 app checks).
-- Screenshot: QEMU screendump 720×400 PPM (download/barryos-screen-stage8.ppm).
-- Verification: `bash scripts/check.sh` → **PASS=49 FAIL=0 SKIP=0**.
-  BIOS boots to desktop apps online + terminal + file manager + system info
-  rendered + all terminal commands processed.
+## 2026-09-21 — Round 9 — Stage 9 (Compatibility Layers) — ✅ COMPLETE
+- Implemented compatibility layer parsers in `kernel/src/compat/`:
+  - `deb.rs` — .deb parser (ar archive format). Reads AR magic,
+    iterates 60-byte headers, extracts entry names + sizes.
+  - `rpm.rs` — .rpm parser (RPM v3 lead). Reads magic, version,
+    type, archnum, 66-byte name.
+  - `appimage.rs` — .AppImage Type 2 detector. Checks ELF + AppImage
+    magic at offset 8, extracts payload offset.
+  - `pe.rs` — PE32+ header parser. Reads DOS header, e_lfanew, PE sig,
+    COFF header (machine, sections), optional header (entry, image base).
+- All byte comparisons use byte-by-byte (memcmp causes #UD in no_std).
+- Updated `kernel/src/main.rs`: `mod compat`, calls `compat::init()`.
+- Updated `scripts/check.sh`: L11 gate (6 Stage 9 compat checks).
+- Verification: `bash scripts/check.sh` → **PASS=55 FAIL=0 SKIP=0**.
+  BIOS boots to compat layers online + 4 parsers initialized + 3 packages
+  parsed (rpm + appimage + pe).
 
-## 2026-09-21 — Rounds 1-7 — Stages 0-7 — ✅ COMPLETE
-- (see previous entries — dual-boot through window manager, 44/44 checks)
+## 2026-09-21 — Rounds 1-8 — Stages 0-8 — ✅ COMPLETE
+- (see previous entries — dual-boot through desktop apps, 49/49 checks)

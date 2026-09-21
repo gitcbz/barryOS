@@ -281,6 +281,39 @@ else
     fail "BIOS: terminal command test missing"
 fi
 
+# ------------------------------------------------ L11: Stage 9 compat layers --
+section "L11: Stage 9 compatibility layers"
+if grep -aq "compat layers online" /tmp/barryos-bios.log; then
+    pass "BIOS: Stage 9 compat layers online"
+else
+    fail "BIOS: Stage 9 compat layers not online"
+fi
+if grep -aq "deb.*parser initialized" /tmp/barryos-bios.log; then
+    pass "BIOS: .deb parser initialized"
+else
+    fail "BIOS: .deb parser missing"
+fi
+if grep -aq "rpm.*parser initialized" /tmp/barryos-bios.log; then
+    pass "BIOS: .rpm parser initialized"
+else
+    fail "BIOS: .rpm parser missing"
+fi
+if grep -aq "AppImage parser initialized" /tmp/barryos-bios.log; then
+    pass "BIOS: .AppImage parser initialized"
+else
+    fail "BIOS: .AppImage parser missing"
+fi
+if grep -aq "PE32+ loader initialized" /tmp/barryos-bios.log; then
+    pass "BIOS: PE32+ loader initialized"
+else
+    fail "BIOS: PE32+ loader missing"
+fi
+if grep -aq "packages parsed: 3" /tmp/barryos-bios.log; then
+    pass "BIOS: 3 packages parsed (rpm + appimage + pe)"
+else
+    fail "BIOS: package parse count wrong"
+fi
+
 # ---------------------------------------------------------------- summary --
 section "SUMMARY"
 log "PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"

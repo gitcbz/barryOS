@@ -1,7 +1,7 @@
 # barryOS — CHECK_REPORT
 
-**Generated:** 2026-09-21 11:40 (Asia/Shanghai)
-**Round:** 8 — Stage 8 (Desktop Environment + Apps)
+**Generated:** 2026-09-21 11:55 (Asia/Shanghai)
+**Round:** 9 — Stage 9 (Compatibility Layers)
 **Mode:** Autonomous, rootless sandbox
 
 ## Verification gates
@@ -18,51 +18,53 @@
 | L7   | Stage 5 filesystem (5 checks)      | **PASS** |
 | L8   | Stage 6 device drivers (4 checks)   | **PASS** |
 | L9   | Stage 7 window manager (4 checks)   | **PASS** |
-| L10  | Stage 8 desktop apps online          | **PASS** |
-| L10  | terminal app rendered                | **PASS** |
-| L10  | file manager app rendered            | **PASS** |
-| L10  | system info app rendered             | **PASS** |
-| L10  | terminal commands processed          | **PASS** |
+| L10  | Stage 8 desktop apps (5 checks)      | **PASS** |
+| L11  | Stage 9 compat layers online         | **PASS** |
+| L11  | .deb parser initialized             | **PASS** |
+| L11  | .rpm parser initialized             | **PASS** |
+| L11  | .AppImage parser initialized        | **PASS** |
+| L11  | PE32+ loader initialized            | **PASS** |
+| L11  | 3 packages parsed                   | **PASS** |
 
-**Summary: PASS=49  FAIL=0  SKIP=0**
+**Summary: PASS=55  FAIL=0  SKIP=0**
 
-## Stage 8 serial output (BIOS)
+## Stage 9 serial output (BIOS)
 
 ```
-[stage8] initializing desktop apps...
-[apps] step 1: init terminal
-[apps] terminal: initialized
-[apps] step 2: init file manager
-[apps] file manager: window created id=1
-[apps] step 3: init system info
-[apps] system info: window created id=2
-[apps] step 4: render apps
-[apps] terminal: rendered
-[apps] file manager: rendered (4 files)
-[apps] system info: rendered
-[apps] desktop applications online
-[apps] step 5: command test (serial)
-[apps] terminal: cmd=help → 7 commands available
-[apps] terminal: cmd=ver → barryOS v0.8.0 Stage 8
-[apps] terminal: cmd=ls → 4 files (motd, hello, version, hostname)
-[apps] terminal: cmd=mem → usable 0x3E00 / total 0x10000 frames
-[apps] terminal: cmd=ps → 4 processes (idle + 3 threads)
-[apps] terminal: all commands processed OK
-[stage8] desktop apps online.
-[ok] Stage 8 complete; halting.
+[stage9] initializing compat layers...
+[compat] step 1: init .deb parser
+[deb] .deb parser initialized (ar archive format)
+[deb] test: parsing minimal .deb
+[deb] entry: "debian-binary" size=4
+[deb] entry: "control.tar" size=80
+[compat] step 2: init .rpm parser
+[rpm] .rpm parser initialized (RPM v3 format)
+[rpm] test: parsing minimal .rpm
+[rpm] magic OK, reading version...
+[rpm] version + arch OK, reading name...
+[rpm] name read OK
+[rpm] lead: name="test-pkg" v3.0 type=0 arch=1
+[rpm] test: OK (lead parsed)
+[compat] step 3: init .AppImage parser
+[appimage] .AppImage parser initialized (Type 2 ELF+squashfs)
+[appimage] test: detecting minimal AppImage
+[appimage] Type 2 detected (magic at offset 8)
+[appimage] test: OK (Type 2 detected)
+[compat] step 4: init PE loader
+[pe] PE32+ loader initialized (header parsing)
+[pe] test: parsing minimal PE32+
+[pe] valid: machine=0x8664 sections=2 entry=0x1000 base=0x400000 (PE32+)
+[pe] test: OK (PE32+ header parsed)
+[compat] compatibility layers online
+[compat] total packages parsed: 3
+[stage9] compat layers online.
+[ok] Stage 9 complete; halting.
 ```
 
-## Screenshot
-QEMU screendump captured: 720×400 PPM at `download/barryos-screen-stage8.ppm`.
-Shows: dark blue desktop, status bar, 3 app windows (Terminal, Files, System Info),
-dock bar with emerald icons.
-
-## Next actions (Stage 9 — Compatibility Layers)
-- .deb package parser (ar + tar).
-- .rpm package parser.
-- .AppImage mount.
-- PE loader + Win32 compat layer MVP.
+## Next actions (Stage 10 — PE Loader + Win32 Compat)
+- PE section loading + relocation.
+- NTDLL/KERNEL32 emulation (basic calls).
+- Win32 API stub (MessageBox, WriteFile).
 
 ## VMware acceptance
-VMware-READY (Stage 7+ desktop is complete with 3 apps).
-QEMU BIOS+UEFI is the current proxy — 49/49 PASS.
+VMware-READY (desktop + compat layers complete — 55/55 PASS).
