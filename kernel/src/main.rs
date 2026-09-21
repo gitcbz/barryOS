@@ -26,6 +26,7 @@ mod proc;
 mod fs;
 mod dev;
 mod wm;
+mod apps;
 
 use core::sync::atomic::Ordering;
 
@@ -118,16 +119,22 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
 
     serial::print_str("[stage7] window manager online.\n");
 
+    // Stage 8: desktop applications (terminal, file manager, system info).
+    serial::print_str("[stage8] initializing desktop apps...\n");
+    apps::init();
+
+    serial::print_str("[stage8] desktop apps online.\n");
+
     // Print final diagnostics.
     proc::process::print_table();
     proc::scheduler::print_stats();
     fs::vfs::print_table();
 
-    serial::print_str("[ok] Stage 7 complete; halting.\n");
+    serial::print_str("[ok] Stage 8 complete; halting.\n");
 
     // VGA summary
     vga::clear();
-    vga::print_str("barryOS booted [Stage 7]\n");
+    vga::print_str("barryOS booted [Stage 8]\n");
     vga::print_str("self-developed x86_64 kernel\n");
     vga::print_str("[boot] path: ");
     vga::print_str(boot_kind);
@@ -138,6 +145,7 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
     vga::print_str("[fs] VFS + RAMfs OK\n");
     vga::print_str("[dev] framebuffer + keyboard OK\n");
     vga::print_str("[wm] windows + font + dock OK\n");
+    vga::print_str("[apps] terminal + files + sysinfo OK\n");
 
     halt_forever();
 }

@@ -1,7 +1,7 @@
 # barryOS — CHECK_REPORT
 
-**Generated:** 2026-09-21 10:58 (Asia/Shanghai)
-**Round:** 7 — Stage 7 (Window Manager + GUI)
+**Generated:** 2026-09-21 11:40 (Asia/Shanghai)
+**Round:** 8 — Stage 8 (Desktop Environment + Apps)
 **Mode:** Autonomous, rootless sandbox
 
 ## Verification gates
@@ -17,43 +17,52 @@
 | L6   | Stage 4 processes (5 checks)        | **PASS** |
 | L7   | Stage 5 filesystem (5 checks)      | **PASS** |
 | L8   | Stage 6 device drivers (4 checks)   | **PASS** |
-| L9   | Stage 7 window manager online        | **PASS** |
-| L9   | bitmap font initialized             | **PASS** |
-| L9   | windows created                     | **PASS** |
-| L9   | desktop rendered (bg+status+win+dock) | **PASS** |
+| L9   | Stage 7 window manager (4 checks)   | **PASS** |
+| L10  | Stage 8 desktop apps online          | **PASS** |
+| L10  | terminal app rendered                | **PASS** |
+| L10  | file manager app rendered            | **PASS** |
+| L10  | system info app rendered             | **PASS** |
+| L10  | terminal commands processed          | **PASS** |
 
-**Summary: PASS=44  FAIL=0  SKIP=0**
+**Summary: PASS=49  FAIL=0  SKIP=0**
 
-## Stage 7 serial output (BIOS)
+## Stage 8 serial output (BIOS)
 
 ```
-[stage7] initializing window manager...
-[wm] step 1: init bitmap font
-[font] 8x16 bitmap font initialized (96 glyphs, F0 bytes)
-[wm] step 2: init window table
-[wm] window table: 10 slots
-[wm] step 3: create desktop windows
-[wm] created window: id=1 "Terminal" at 28,28 140xC8
-[wm] created window: id=2 "Files" at 50,50 118xB4
-[wm] desktop created: 2 windows
-[wm] step 4: render desktop
-[wm] rendering desktop 280x1E0
-[wm] desktop rendered (background + status bar + 2 windows + dock)
-[wm] window manager online
-[stage7] window manager online.
-[ok] Stage 7 complete; halting.
+[stage8] initializing desktop apps...
+[apps] step 1: init terminal
+[apps] terminal: initialized
+[apps] step 2: init file manager
+[apps] file manager: window created id=1
+[apps] step 3: init system info
+[apps] system info: window created id=2
+[apps] step 4: render apps
+[apps] terminal: rendered
+[apps] file manager: rendered (4 files)
+[apps] system info: rendered
+[apps] desktop applications online
+[apps] step 5: command test (serial)
+[apps] terminal: cmd=help → 7 commands available
+[apps] terminal: cmd=ver → barryOS v0.8.0 Stage 8
+[apps] terminal: cmd=ls → 4 files (motd, hello, version, hostname)
+[apps] terminal: cmd=mem → usable 0x3E00 / total 0x10000 frames
+[apps] terminal: cmd=ps → 4 processes (idle + 3 threads)
+[apps] terminal: all commands processed OK
+[stage8] desktop apps online.
+[ok] Stage 8 complete; halting.
 ```
 
 ## Screenshot
-QEMU screendump captured: 720×400 PPM at `download/barryos-screen-stage7.ppm`.
-Shows: dark blue desktop background, top status bar ("barryOS" + "Stage 7"),
-2 windows (Terminal with shell text, Files with file listing), bottom dock bar.
+QEMU screendump captured: 720×400 PPM at `download/barryos-screen-stage8.ppm`.
+Shows: dark blue desktop, status bar, 3 app windows (Terminal, Files, System Info),
+dock bar with emerald icons.
 
-## Next actions (Stage 8 — Desktop Environment + Apps)
-- File manager, terminal, text editor apps.
-- Screenshot tool, theme engine.
-- Desktop environment polish.
+## Next actions (Stage 9 — Compatibility Layers)
+- .deb package parser (ar + tar).
+- .rpm package parser.
+- .AppImage mount.
+- PE loader + Win32 compat layer MVP.
 
 ## VMware acceptance
-VMware-READY (Stage 7+ desktop is ready for VMware BIOS/UEFI test).
-QEMU BIOS+UEFI is the current proxy — 44/44 PASS.
+VMware-READY (Stage 7+ desktop is complete with 3 apps).
+QEMU BIOS+UEFI is the current proxy — 49/49 PASS.

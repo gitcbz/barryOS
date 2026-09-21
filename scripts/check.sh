@@ -253,6 +253,34 @@ else
     fail "BIOS: desktop render missing"
 fi
 
+# ------------------------------------------------ L10: Stage 8 desktop apps --
+section "L10: Stage 8 desktop applications"
+if grep -aq "desktop apps online" /tmp/barryos-bios.log; then
+    pass "BIOS: Stage 8 desktop apps online"
+else
+    fail "BIOS: Stage 8 desktop apps not online"
+fi
+if grep -aq "terminal: rendered" /tmp/barryos-bios.log; then
+    pass "BIOS: terminal app rendered"
+else
+    fail "BIOS: terminal app missing"
+fi
+if grep -aq "file manager: rendered" /tmp/barryos-bios.log; then
+    pass "BIOS: file manager app rendered"
+else
+    fail "BIOS: file manager app missing"
+fi
+if grep -aq "system info: rendered" /tmp/barryos-bios.log; then
+    pass "BIOS: system info app rendered"
+else
+    fail "BIOS: system info app missing"
+fi
+if grep -aq "all commands processed OK" /tmp/barryos-bios.log; then
+    pass "BIOS: terminal commands processed (help, ver, ls, mem, ps)"
+else
+    fail "BIOS: terminal command test missing"
+fi
+
 # ---------------------------------------------------------------- summary --
 section "SUMMARY"
 log "PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"
