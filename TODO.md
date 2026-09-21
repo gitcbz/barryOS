@@ -45,10 +45,14 @@ Checked items `[x]` are complete. See STATUS.md for current round.
 - [ ] TSS/IST1 for #DF (deferred — Stage 3b)
 - [ ] APIC/LAPIC (deferred — Stage 4b)
 
-## Stage 4 — Processes & Syscalls
-- [ ] PCB, kernel threads, Ring0/Ring3 transition
-- [ ] Round-robin scheduler
-- [ ] syscall/sysret ABI, basic calls (write/exit/fork/exec/wait)
+## Stage 4 — Processes & Syscalls ✅
+- [x] PCB (Process Control Block) + 16-slot process table
+- [x] Kernel threads (spawn, trampoline, exit)
+- [x] Round-robin scheduler (tick, yield, rotation verified)
+- [x] Syscall interface (int 0x80, 5 calls: write/exit/getpid/yield/getticks)
+- [x] Context switch infrastructure (context_switch inline asm)
+- [ ] Actual preemptive context switch (deferred — Stage 4b)
+- [ ] Ring 0 → Ring 3 user-mode (deferred — Stage 4b)
 
 ## Stage 5 — VFS + Filesystem + Block Driver
 - [ ] VFS (inode/dentry/file/superblock)

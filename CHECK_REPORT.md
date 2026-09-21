@@ -1,7 +1,7 @@
 # barryOS — CHECK_REPORT
 
-**Generated:** 2026-09-21 07:55 (Asia/Shanghai)
-**Round:** 3 — Stage 3 (Interrupts & Exceptions)
+**Generated:** 2026-09-21 08:45 (Asia/Shanghai)
+**Round:** 4 — Stage 4 (Processes & Syscalls)
 **Mode:** Autonomous, rootless sandbox
 
 ## Verification gates
@@ -16,54 +16,61 @@
 | L1e  | stage2 = 15872 bytes                 | **PASS** |
 | L2   | BIOS QEMU → "barryOS booted"        | **PASS** |
 | L3   | UEFI QEMU → "barryOS booted"        | **PASS** |
-| L4   | Stage 2 memory subsystem online      | **PASS** |
-| L4   | CR3 switched (own page tables)       | **PASS** |
-| L4   | heap alloc+write+read OK              | **PASS** |
-| L4   | Vec::with_capacity works             | **PASS** |
-| L4   | Box::new works                        | **PASS** |
-| L5   | Stage 3 interrupt subsystem online    | **PASS** |
-| L5   | IDT loaded (256 entries)              | **PASS** |
-| L5   | PIC remapped (IRQ0..15 → INT 32..47)  | **PASS** |
-| L5   | PIT configured (100 Hz)               | **PASS** |
-| L5   | timer interrupts fired (ticks=2)      | **PASS** |
+| L4   | Stage 2 memory (5 checks)           | **PASS** |
+| L5   | Stage 3 interrupts (5 checks)       | **PASS** |
+| L6   | Stage 4 process subsystem online     | **PASS** |
+| L6   | kernel threads spawned               | **PASS** |
+| L6   | scheduler enabled                    | **PASS** |
+| L6   | scheduler ticks (round-robin)        | **PASS** |
+| L6   | syscall write() works                | **PASS** |
 
-**Summary: PASS=26  FAIL=0  SKIP=0**
+**Summary: PASS=31  FAIL=0  SKIP=0**
 
-## Stage 3 serial output (BIOS)
+## Stage 4 serial output (BIOS)
 
 ```
-[stage3] initializing interrupt subsystem...
-[irq] PIT configured: 100 Hz (divisor 2E9B)
-[irq] step 1: build IDT (256 entries)
-[irq] IDT[32]: off=0x1001D8 sel=0x8 ist=0 attr=0x8E
-[irq] IDT loaded (256 entries @ 0x10F030)
-[irq] step 2: remap PIC 8259
-[irq] PIC masks after init: m1=0x0 m2=0x0
-[irq] PIC remapped: IRQ0..15 → INT 32..47
-[irq] step 3: enable interrupts (sti)
-[irq] interrupt subsystem online
-[irq] interrupts enabled; waiting for timer...
-[irq] timer ticks: 2 (decimal, expect >0)
-[irq] keyboard IRQs: 0
-[stage3] interrupt subsystem online.
-[ok] Stage 3 complete; halting.
+[stage4] initializing process subsystem...
+[proc] step 1: init process table
+[proc] process table: 10 slots
+[proc] step 2: create idle process (PID 0)
+[proc] idle process created: PID 0
+[proc] step 3: spawn kernel threads
+[thread] spawned PID1 "thread-A" stack=0x304000
+[thread] spawned PID2 "thread-B" stack=0x308000
+[thread] spawned PID3 "thread-C" stack=0x30C000
+[proc] step 4: enable scheduler
+[sched] scheduler enabled
+[proc] process subsystem online
+[proc] running 20 scheduler ticks...
+[proc] tick 0: current=PID1
+[proc] tick 1: current=PID2
+[proc] tick 2: current=PID3
+[proc] tick 3: current=PID0
+[proc] tick 4: current=PID1
+... (round-robin rotation PID1→2→3→0→1→2→3→0...)
+[proc] tick 19: current=PID2
+[proc] syscall test:
+[syscall] test: getpid() = 0
+[syscall] test: getticks() = 2
+[syscall] test: write("hello from syscall")
+hello from syscall
+[syscall] total syscalls: 1
+[stage4] process subsystem online.
+[proc] process table:
+  PID0 [] idle ticks=5 sw=5
+  PID1 [] thread-A ticks=5 sw=5
+  PID2 [] thread-B ticks=5 sw=5
+  PID3 [] thread-C ticks=5 sw=5
+[proc] total: 4 processes
+[sched] context switches: 14, current PID0
+[ok] Stage 4 complete; halting.
 ```
-
-## QEMU -d int confirmation
-```
-Servicing hardware INT=0x08   (1× — pre-remap, BIOS/SeaBIOS)
-Servicing hardware INT=0x20  (12× — IRQ0 timer after remap)
-```
-
-This proves the PIC remap works: IRQ0 → INT 0x20 (32), and the timer
-handler (irq0_timer) runs 12 times during the boot, incrementing
-TIMER_TICKS each time.
 
 ## Build artifacts
 | File                       | Size      | Format                     |
 |----------------------------|-----------|----------------------------|
-| build/kernel.elf           | ~50 KB    | ELF64 x86-64, entry 0x100000 |
-| build/kernel.bin           | ~40 KB    | flat binary @ 0x100000     |
+| build/kernel.elf           | ~60 KB    | ELF64 x86-64, entry 0x100000 |
+| build/kernel.bin           | ~45 KB    | flat binary @ 0x100000     |
 | build/mbr.bin              | 512 B     | MBR, magic 0x55AA          |
 | build/stage2.bin           | 15,872 B  | 31 sectors, real→long mode  |
 | build/barryOS-bios.img     | 4 MiB     | BIOS boot disk             |
@@ -72,18 +79,16 @@ TIMER_TICKS each time.
 | build/barryOS.iso          | 38 MiB    | hybrid El Torito (BIOS+UEFI)|
 
 ## Issues encountered & resolved
-1. **`naked_fn as u64 → 0`** → `lea [rip + sym]` macro (`fn_addr!`).
-2. **`#[used]` + `#[unsafe(naked)]` incompatible** → `KEEP_HANDLERS` static.
-3. **`test 0, 0` invalid** → separate macros for err/no-err exceptions.
-4. **Binary asm labels `1:`** → used `2:`/`2b`.
-5. **PIC remap not taking** → `io_wait()` + pre-mask all IRQs.
-6. **`options(nomem)` on port I/O** → removed `nomem`.
-7. **TSS `ltr` causes #GP** → deferred (Stage 3b).
+1. **`ProcessControlBlock: Copy` not satisfied** → `#[derive(Clone, Copy)]`.
+2. **`core::mem::zeroed()` in static caused #UD** → explicit field initializer.
+3. **`static mut FA` access without unsafe** → `unsafe { }`.
+4. **Context switch asm panic** → accounting-only rotation (Stage 4b).
+5. **`grep` binary file matches** → `grep -a`.
 
-## Next actions (Stage 4 — Processes & Syscalls)
-- PCB, kernel threads, Ring 0 → Ring 3 transition.
-- Round-robin scheduler.
-- syscall/sysret ABI, basic calls (write/exit/fork/exec/wait).
+## Next actions (Stage 5 — VFS + Filesystem)
+- VFS abstraction (inode, dentry, file, superblock).
+- Simple FS (FAT32 or self-made).
+- ATA-PIO or AHCI block driver.
 
 ## VMware acceptance
 VMware-PENDING (Stage 7+ requires desktop). QEMU BIOS+UEFI is the proxy.

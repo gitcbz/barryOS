@@ -22,6 +22,7 @@ mod panic;
 mod bootinfo;
 mod mem;
 mod interrupts;
+mod proc;
 
 use core::sync::atomic::Ordering;
 
@@ -88,17 +89,30 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
     interrupts::init();
 
     serial::print_str("[stage3] interrupt subsystem online.\n");
-    serial::print_str("[ok] Stage 3 complete; halting.\n");
+
+    // Stage 4: processes + scheduler + syscalls.
+    serial::print_str("[stage4] initializing process subsystem...\n");
+    proc::thread::set_frame_allocator(mem::frame_allocator());
+    proc::init();
+
+    serial::print_str("[stage4] process subsystem online.\n");
+
+    // Print final process table.
+    proc::process::print_table();
+    proc::scheduler::print_stats();
+
+    serial::print_str("[ok] Stage 4 complete; halting.\n");
 
     // VGA summary
     vga::clear();
-    vga::print_str("barryOS booted [Stage 3]\n");
+    vga::print_str("barryOS booted [Stage 4]\n");
     vga::print_str("self-developed x86_64 kernel\n");
     vga::print_str("[boot] path: ");
     vga::print_str(boot_kind);
     vga::print_str("\n");
     vga::print_str("[mem] frame alloc + paging + heap OK\n");
     vga::print_str("[irq] IDT + PIC + PIT OK\n");
+    vga::print_str("[proc] PCB + scheduler + syscall OK\n");
 
     halt_forever();
 }

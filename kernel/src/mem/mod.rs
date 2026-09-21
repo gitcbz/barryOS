@@ -23,6 +23,14 @@ pub static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// in the BIOS boot path — see DECISIONS D12).  Stage 2 is single-threaded.
 static mut BI: MemMap = MemMap::new();
 
+/// Static frame allocator — globally accessible for proc/syscall subsystems.
+static mut FA: frame_alloc::BitmapFrameAllocator = frame_alloc::BitmapFrameAllocator::new();
+
+/// Get a mutable reference to the global frame allocator.
+pub fn frame_allocator() -> &'static mut frame_alloc::BitmapFrameAllocator {
+    unsafe { &mut *core::ptr::addr_of_mut!(FA) }
+}
+
 /// Initialize the full memory subsystem.
 pub fn init(boot_info: usize) {
     serial::print_str("[mem] step 1: parse memmap\n");
@@ -30,16 +38,15 @@ pub fn init(boot_info: usize) {
     unsafe { BI.print(); }
 
     serial::print_str("[mem] step 2: frame allocator\n");
-    let mut fa = frame_alloc::BitmapFrameAllocator::new();
-    unsafe { fa.init(&BI); }
-    fa.print_stats();
+    unsafe { FA.init(&BI); }
+    unsafe { FA.print_stats(); }
 
     serial::print_str("[mem] step 3: paging remap\n");
-    paging::remap(&mut fa);
+    unsafe { paging::remap(&mut FA); }
     paging::print_stats();
 
     serial::print_str("[mem] step 4: heap init\n");
-    heap::init(&mut fa);
+    heap::init(frame_allocator());
     heap::print_stats();
 
     serial::print_str("[mem] step 5: heap smoke test\n");

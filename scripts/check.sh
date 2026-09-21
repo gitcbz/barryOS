@@ -55,7 +55,7 @@ fi
 
 section "L1d: BOOTX64.EFI format"
 effmt=$(file -b build/BOOTX64.EFI 2>/dev/null)
-if echo "$effmt" | grep -qiE "PE32\+|EFI"; then pass "EFI format: $effmt"; else fail "EFI format: $effmt"; fi
+if echo "$effmt" | grep -aqiE "PE32\+|EFI"; then pass "EFI format: $effmt"; else fail "EFI format: $effmt"; fi
 
 section "L1e: stage2 size = 31 sectors"
 s2sz=$(stat -c%s build/stage2.bin 2>/dev/null)
@@ -68,12 +68,12 @@ timeout 20 qemu-system-x86_64 -L "$QEMU_BIOS_DIR" \
     -drive format=raw,file=build/barryOS-bios.img \
     -serial stdio -display none -no-reboot -no-shutdown \
     >/tmp/barryos-bios.log 2>&1
-if grep -q "barryOS booted" /tmp/barryos-bios.log; then
+if grep -aq "barryOS booted" /tmp/barryos-bios.log; then
     pass "BIOS: serial contains 'barryOS booted'"
 else
     fail "BIOS: serial missing 'barryOS booted'"
 fi
-if grep -qiE "triple fault|panic|general protection" /tmp/barryos-bios.log; then fail "BIOS: fault detected"; else pass "BIOS: no faults"; fi
+if grep -aqiE "triple fault|panic|general protection" /tmp/barryos-bios.log; then fail "BIOS: fault detected"; else pass "BIOS: no faults"; fi
 cp /tmp/barryos-bios.log build/logs/qemu-bios.log
 
 # ----------------------------------------------------------- L3: UEFI boot --
@@ -86,7 +86,7 @@ timeout 25 qemu-system-x86_64 -L "$QEMU_BIOS_DIR" \
     -drive format=raw,file=build/barryOS-uefi.img \
     -serial stdio -display none -no-reboot -no-shutdown \
     >/tmp/barryos-uefi.log 2>&1
-if grep -q "barryOS booted" /tmp/barryos-uefi.log; then
+if grep -aq "barryOS booted" /tmp/barryos-uefi.log; then
     pass "UEFI: serial contains 'barryOS booted'"
 else
     fail "UEFI: serial missing 'barryOS booted'"
@@ -95,27 +95,27 @@ cp /tmp/barryos-uefi.log build/logs/qemu-uefi.log
 
 # ---------------------------------------------------- L4: Stage 2 memory --
 section "L4: Stage 2 memory subsystem"
-if grep -q "memory subsystem online" /tmp/barryos-bios.log; then
+if grep -aq "memory subsystem online" /tmp/barryos-bios.log; then
     pass "BIOS: Stage 2 memory subsystem online"
 else
     fail "BIOS: Stage 2 memory subsystem not online"
 fi
-if grep -q "CR3 0x" /tmp/barryos-bios.log; then
+if grep -aq "CR3 0x" /tmp/barryos-bios.log; then
     pass "BIOS: CR3 switched (own page tables)"
 else
     fail "BIOS: CR3 switch missing"
 fi
-if grep -q "heap test 1: val=0x123456789ABCDEF0 OK" /tmp/barryos-bios.log; then
+if grep -aq "heap test 1: val=0x123456789ABCDEF0 OK" /tmp/barryos-bios.log; then
     pass "BIOS: heap alloc+write+read OK"
 else
     fail "BIOS: heap smoke test failed"
 fi
-if grep -q "Vec with_capacity" /tmp/barryos-bios.log; then
+if grep -aq "Vec with_capacity" /tmp/barryos-bios.log; then
     pass "BIOS: Vec::with_capacity works"
 else
     fail "BIOS: Vec test missing"
 fi
-if grep -q "Box=0xDEADBEEF OK" /tmp/barryos-bios.log; then
+if grep -aq "Box=0xDEADBEEF OK" /tmp/barryos-bios.log; then
     pass "BIOS: Box::new works"
 else
     fail "BIOS: Box test failed"
@@ -123,32 +123,60 @@ fi
 
 # ---------------------------------------------------- L5: Stage 3 interrupts --
 section "L5: Stage 3 interrupt subsystem"
-if grep -q "interrupt subsystem online" /tmp/barryos-bios.log; then
+if grep -aq "interrupt subsystem online" /tmp/barryos-bios.log; then
     pass "BIOS: Stage 3 interrupt subsystem online"
 else
     fail "BIOS: Stage 3 interrupt subsystem not online"
 fi
-if grep -q "IDT loaded (256 entries" /tmp/barryos-bios.log; then
+if grep -aq "IDT loaded (256 entries" /tmp/barryos-bios.log; then
     pass "BIOS: IDT loaded (256 entries)"
 else
     fail "BIOS: IDT load missing"
 fi
-if grep -q "PIC remapped" /tmp/barryos-bios.log; then
+if grep -aq "PIC remapped" /tmp/barryos-bios.log; then
     pass "BIOS: PIC remapped (IRQ0..15 → INT 32..47)"
 else
     fail "BIOS: PIC remap missing"
 fi
-if grep -q "PIT configured" /tmp/barryos-bios.log; then
+if grep -aq "PIT configured" /tmp/barryos-bios.log; then
     pass "BIOS: PIT configured (100 Hz)"
 else
     fail "BIOS: PIT config missing"
 fi
 # Verify timer actually ticked (IRQ0 handler ran).
-ticks=$(grep "timer ticks:" /tmp/barryos-bios.log | grep -oE "[0-9]+" | head -1)
+ticks=$(grep -a "timer ticks:" /tmp/barryos-bios.log | grep -oE "[0-9]+" | head -1)
 if [ -n "$ticks" ] && [ "$ticks" -gt 0 ] 2>/dev/null; then
     pass "BIOS: timer interrupts fired (ticks=$ticks)"
 else
     fail "BIOS: no timer ticks (irq0 handler didn't run)"
+fi
+
+# ---------------------------------------------------- L6: Stage 4 processes --
+section "L6: Stage 4 process subsystem"
+if grep -aq "process subsystem online" /tmp/barryos-bios.log; then
+    pass "BIOS: Stage 4 process subsystem online"
+else
+    fail "BIOS: Stage 4 process subsystem not online"
+fi
+if grep -aq "spawned PID" /tmp/barryos-bios.log; then
+    pass "BIOS: kernel threads spawned"
+else
+    fail "BIOS: thread spawn missing"
+fi
+if grep -aq "scheduler enabled" /tmp/barryos-bios.log; then
+    pass "BIOS: scheduler enabled"
+else
+    fail "BIOS: scheduler not enabled"
+fi
+if grep -aq "tick.*current=PID" /tmp/barryos-bios.log; then
+    pass "BIOS: scheduler ticks (round-robin PID rotation)"
+else
+    fail "BIOS: no scheduler ticks"
+fi
+if grep -aq "hello from syscall" /tmp/barryos-bios.log; then
+    pass "BIOS: syscall write() works"
+else
+    fail "BIOS: syscall test missing"
 fi
 
 # ---------------------------------------------------------------- summary --

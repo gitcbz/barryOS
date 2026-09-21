@@ -1,57 +1,56 @@
 # barryOS — DECISIONS LOG
 
-## [D18] IDT handler address via `lea [rip + sym]` macro — 2026-09-21
-- **Problem**: Rust nightly 1.100 has a codegen bug where `naked_fn as u64`
-  returns 0 for functions marked `#[naked]`. The IDT entries all pointed
-  at 0x0, so interrupts crashed.
-- **Fix**: `fn_addr!` macro that emits `lea {out}, [rip + {sym}]` inline
-  asm, capturing the function symbol directly. This gives the correct
-  runtime address. The `set_entry!` macro wraps this + IDT field writes.
-- **Trade-off**: Can't pass function pointers as parameters (the `sym`
-  operand requires a path, not a value), so we use a macro per IDT entry.
+## [D25] PCB uses `#[derive(Clone, Copy)]` for static array init — 2026-09-21
+- **Problem**: `[ProcessControlBlock::empty(); MAX_PROCESSES]` requires
+  `Copy` bound, but PCB has a `CpuContext` field (which is Copy) but PCB
+  itself wasn't derived Copy.
+- **Fix**: Added `#[derive(Clone, Copy)]` to both `ProcessControlBlock`
+  and `CpuContext`. PCB is ~200 bytes; copying it is cheap for a 16-slot
+  table.
 
-## [D19] KEEP_HANDLERS static (force linker retention) — 2026-09-21
-- **Problem**: `#[used]` attribute is incompatible with `#[unsafe(naked)]`.
-  Without it, `--gc-sections` removes the handler stubs (they're only
-  referenced via the IDT, which the compiler can't see).
-- **Fix**: A `pub static KEEP_HANDLERS: [unsafe extern "C" fn() -> (); 5]`
-  array referencing 5 representative handlers. The `#[used]` on this
-  static keeps it, and the function references keep all stubs alive.
+## [D26] Explicit field initializer instead of `core::mem::zeroed()` — 2026-09-21
+- **Problem**: `static mut PROC_TABLE = unsafe { core::mem::zeroed() }`
+  caused a #UD (invalid opcode) at runtime — the compiler generated a
+  `ud2` panic instruction for the zeroed initialization.
+- **Fix**: Explicit `ProcessControlBlock { pid: 0, state: Free, ... }`
+  initializer with all fields listed. This is const-safe and doesn't
+  trigger the `zeroed()` codegen issue.
 
-## [D20] Separate exception macros (with/without error code) — 2026-09-21
-- **Problem**: Using `test {has_err}, {has_err}` + conditional jump in a
-  single macro generated `test 0, 0` which is invalid x86.
-- **Fix**: Two macros: `exception_stub_no_err!` (pushes fake 0 error code)
-  and `exception_stub_err!` (CPU already pushed error code). Exceptions
-  with error codes: #DF, #TS, #NP, #SS, #GP, #PF.
+## [D27] Stage 4 uses accounting-only scheduler rotation — 2026-09-21
+- **Problem**: The `context_switch()` inline asm (push callee-saved,
+  swap RSP, pop, ret) caused a panic when called — likely because the
+  initial thread stack setup was wrong (the trampoline entry point
+  wasn't correctly set up for the return address).
+- **Decision**: Stage 4 uses an accounting-only rotation: `tick()`
+  updates the PCB states + tick/switch counters + current PID pointer
+  without actually swapping stacks. This proves the scheduler logic
+  works (round-robin PID rotation is verified in serial output).
+- **Stage 4b**: Will fix the context switch (debug the stack setup +
+  trampoline, implement actual preemptive timer-driven switching).
 
-## [D21] Binary asm labels use `2:`/`2b` (not `1:`/`1b`) — 2026-09-21
-- **Problem**: Rust 1.100 warns "avoid using labels containing only the
-  digits 0 and 1" (binary asm labels feature). Using `1:` caused a deny
-  warning.
-- **Fix**: Used digit `2` for local labels (`2:`, `2f`, `2b`). Digit 2+
-  is allowed.
+## [D28] Global frame allocator for proc subsystem — 2026-09-21
+- **Problem**: `mem::init()` created a local `BitmapFrameAllocator` that
+  was dropped after init. The proc subsystem needs it to allocate thread
+  stacks.
+- **Fix**: Made the frame allocator a `static mut FA` in `mem/mod.rs`
+  with a `frame_allocator()` accessor that returns `&'static mut`.
+  `proc::thread::set_frame_allocator()` stores the reference globally.
 
-## [D22] PIC io_wait + pre-mask — 2026-09-21
-- **Problem**: PIC remap wasn't taking effect — QEMU still delivered
-  INT 0x08 (old IRQ0 vector) instead of INT 0x20.
-- **Fix**: Added `io_wait()` (writes 0 to port 0x80, the diagnostic
-  port) between each ICW write. Also masked all IRQs (0xFF) before
-  starting init to prevent spurious interrupts during reconfig.
+## [D29] `int 0x80` syscalls (not `syscall`/`sysret`) — 2026-09-21
+- **Decision**: Use `int 0x80` (software interrupt) for syscalls
+  instead of the `syscall`/`sysret` CPU instructions.
+- **Reason**: `syscall`/`sysret` require EFER MSR setup, STAR MSR,
+  and a dedicated syscall entry point — complex for Stage 4. `int 0x80`
+  uses the existing IDT infrastructure (vector 0x80). Stage 4b may
+  upgrade to `syscall`/`sysret` for performance.
 
-## [D23] TSS load (ltr) deferred to Stage 3b — 2026-09-21
-- **Problem**: `ltr` with our TSS selector caused a #GP (triple fault
-  since no IDT was loaded yet at that point in the init sequence).
-- **Decision**: Skip the TSS load for now. The IDT still works for
-  exceptions and IRQs; only #DF (double fault) won't use the IST1 safe
-  stack. Stage 3b will debug the TSS (likely an access byte or limit
-  field issue in the 16-byte TSS descriptor).
+## [D30] UEFI timer ticks = 0 (known issue) — 2026-09-21
+- **Problem**: On the UEFI boot path, the PIT timer doesn't fire (ticks=0),
+  while on BIOS it works (ticks=2).
+- **Likely cause**: UEFI firmware may leave the PIC in a state where the
+  remap doesn't take effect, or the PIT channel 0 isn't connected the
+  same way. OVMF's timer setup differs from SeaBIOS.
+- **Workaround**: BIOS is the primary verification path. UEFI timer
+  fix is deferred to Stage 4b.
 
-## [D24] port_out/port_in without `nomem` option — 2026-09-21
-- **Problem**: `options(nomem)` on the `out dx, al` inline asm told the
-  compiler the write has no memory effect, so it could optimize away
-  consecutive PIC writes.
-- **Fix**: Removed `nomem` from `port_out`/`port_in` asm options. The
-  compiler now treats each I/O port write as a memory operation.
-
-(Previous decisions D01–D17 from Rounds 1-2 are unchanged.)
+(Previous decisions D01–D24 from Rounds 1-3 are unchanged.)
