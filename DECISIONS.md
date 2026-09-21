@@ -1,59 +1,57 @@
 # barryOS — DECISIONS LOG
 
-## [D11] EFI memory types — self-developed enum matching UEFI spec — 2026-09-21
-- `MemoryType` enum in `mem/efi.rs` reproduces UEFI 2.10 spec constants.
-- `is_usable()` returns true only for `ConventionalMemory` (free RAM).
-- `EfiMemoryDescriptor` is `#[repr(C)]` matching the spec (40 bytes).
+## [D18] IDT handler address via `lea [rip + sym]` macro — 2026-09-21
+- **Problem**: Rust nightly 1.100 has a codegen bug where `naked_fn as u64`
+  returns 0 for functions marked `#[naked]`. The IDT entries all pointed
+  at 0x0, so interrupts crashed.
+- **Fix**: `fn_addr!` macro that emits `lea {out}, [rip + {sym}]` inline
+  asm, capturing the function symbol directly. This gives the correct
+  runtime address. The `set_entry!` macro wraps this + IDT field writes.
+- **Trade-off**: Can't pass function pointers as parameters (the `sym`
+  operand requires a path, not a value), so we use a macro per IDT entry.
 
-## [D12] Static MemMap + parse_into (avoid struct return-by-value) — 2026-09-21
-- **Problem**: `memmap::parse() -> MemMap` hung in the BIOS boot path.
-  The MemMap (768+ bytes) was returned by value (sret), which triggered
-  a hang — likely a code generation issue with large struct returns in
-  no_std kernel mode.
-- **Fix**: Made MemMap a `static mut BI` in `mem/mod.rs`. Changed
-  `parse()` to `parse_into(boot_info, &mut MemMap)`. The parse function
-  writes directly into the static via a mutable reference.
-- **Trade-off**: Stage 2 is single-threaded (no preemption), so a static
-  is safe. Stage 4+ (processes) will need per-address-space memmaps.
+## [D19] KEEP_HANDLERS static (force linker retention) — 2026-09-21
+- **Problem**: `#[used]` attribute is incompatible with `#[unsafe(naked)]`.
+  Without it, `--gc-sections` removes the handler stubs (they're only
+  referenced via the IDT, which the compiler can't see).
+- **Fix**: A `pub static KEEP_HANDLERS: [unsafe extern "C" fn() -> (); 5]`
+  array referencing 5 representative handlers. The `#[used]` on this
+  static keeps it, and the function references keep all stubs alive.
 
-## [D13] Raw pointer access for static mut (Rust 2024 safety) — 2026-09-21
-- **Problem**: `BITMAP.as_mut_ptr()` and `&PML4` on `static mut` create
-  temporary references, which is UB in Rust 2024.
-- **Fix**: Use `core::ptr::addr_of_mut!(BITMAP)` and `addr_of!(PML4)` to
-  get raw pointers without creating references. All reads/writes via
-  `read_volatile`/`write_volatile`. This is the recommended Rust 2024
-  pattern for `static mut` access.
+## [D20] Separate exception macros (with/without error code) — 2026-09-21
+- **Problem**: Using `test {has_err}, {has_err}` + conditional jump in a
+  single macro generated `test 0, 0` which is invalid x86.
+- **Fix**: Two macros: `exception_stub_no_err!` (pushes fake 0 error code)
+  and `exception_stub_err!` (CPU already pushed error code). Exceptions
+  with error codes: #DF, #TS, #NP, #SS, #GP, #PF.
 
-## [D14] Bump allocator for Stage 2 (free-list deferred) — 2026-09-21
-- **Problem**: Free-list allocator's `dealloc` caused Vec reallocation
-  to hang (likely `__rust_dealloc` linkage issue with compiler-builtins).
-- **Fix**: Bump allocator (alloc bumps pointer, dealloc is no-op).
-  Uses `AtomicU64` for state (no `UnsafeCell`/`static mut` issues).
-  Enough for Box, Vec::with_capacity, raw alloc. Vec reallocation
-  (grow_amortized) is deferred to Stage 2b.
-- **Trade-off**: Bump allocator never frees memory. For Stage 2 testing
-  this is fine. Stage 2b will implement a proper free-list or slab.
+## [D21] Binary asm labels use `2:`/`2b` (not `1:`/`1b`) — 2026-09-21
+- **Problem**: Rust 1.100 warns "avoid using labels containing only the
+  digits 0 and 1" (binary asm labels feature). Using `1:` caused a deny
+  warning.
+- **Fix**: Used digit `2` for local labels (`2:`, `2f`, `2b`). Digit 2+
+  is allowed.
 
-## [D15] Bitmap reduced from 128 KiB to 8 KiB — 2026-09-21
-- 128 KiB bitmap (4 GiB coverage) worked but was excessive for QEMU's
-  default 128 MiB. Reduced to 8 KiB (256 MiB coverage) to keep .bss
-  small and avoid potential large-allocation issues.
-- Can be increased for VMware VMs with more RAM.
+## [D22] PIC io_wait + pre-mask — 2026-09-21
+- **Problem**: PIC remap wasn't taking effect — QEMU still delivered
+  INT 0x08 (old IRQ0 vector) instead of INT 0x20.
+- **Fix**: Added `io_wait()` (writes 0 to port 0x80, the diagnostic
+  port) between each ICW write. Also masked all IRQs (0xFF) before
+  starting init to prevent spurious interrupts during reconfig.
 
-## [D16] Identity mapping with 1 GiB pages (not higher-half) — 2026-09-21
-- **Decision**: Stage 2 uses 1 GiB pages for identity mapping (0..4 GiB),
-  NOT higher-half remap. PML4[0] and PML4[511] both point to PDPT0.
-- **Reason**: Higher-half remap requires changing the linker script LMA,
-  code model, and carefully handling the address space switch. Too risky
-  for Stage 2 — would break the working boot. Identity mapping is safe.
-- **Stage 2b**: Will attempt higher-half (link at 0xFFFFFFFF80100000,
-  map to physical 0x100000, jump to high address, unmap identity).
+## [D23] TSS load (ltr) deferred to Stage 3b — 2026-09-21
+- **Problem**: `ltr` with our TSS selector caused a #GP (triple fault
+  since no IDT was loaded yet at that point in the init sequence).
+- **Decision**: Skip the TSS load for now. The IDT still works for
+  exceptions and IRQs; only #DF (double fault) won't use the IST1 safe
+  stack. Stage 3b will debug the TSS (likely an access byte or limit
+  field issue in the 16-byte TSS descriptor).
 
-## [D17] BIOS fallback memory map (no E820 yet) — 2026-09-21
-- BIOS stage2 bootloader doesn't pass E820. Kernel synthesizes:
-  - Region 0: [1 MiB, 2 MiB) as LoaderData (kernel image, not allocatable).
-  - Region 1: [2 MiB, 64 MiB) as ConventionalMemory (free RAM).
-- This is a simplification — real E820 querying in stage2 is Stage 2b.
-- UEFI path uses the real UEFI memory map (20+ regions).
+## [D24] port_out/port_in without `nomem` option — 2026-09-21
+- **Problem**: `options(nomem)` on the `out dx, al` inline asm told the
+  compiler the write has no memory effect, so it could optimize away
+  consecutive PIC writes.
+- **Fix**: Removed `nomem` from `port_out`/`port_in` asm options. The
+  compiler now treats each I/O port write as a memory operation.
 
-(Previous decisions D01–D10 from Round 1 are unchanged.)
+(Previous decisions D01–D17 from Rounds 1-2 are unchanged.)

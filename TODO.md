@@ -36,11 +36,14 @@ Checked items `[x]` are complete. See STATUS.md for current round.
 - [ ] Higher-half kernel remap (deferred to Stage 2b)
 
 
-## Stage 3 — Interrupts & Exceptions
-- [ ] IDT setup, CPU exception handlers (#PF, #GP, #UD, #DF)
-- [ ] PIC remap + IRQ handlers; APIC later
-- [ ] PIT/HPET clock tick
-- [ ] Panic → framebuffer + serial dump
+## Stage 3 — Interrupts & Exceptions ✅
+- [x] IDT setup (256 entries, interrupt gates)
+- [x] CPU exception handlers (#DE..#VE, all 21 vectors)
+- [x] PIC 8259 remap (IRQ 0-15 → INT 32-47)
+- [x] PIT 8253 at 100 Hz (timer IRQ0)
+- [x] Keyboard IRQ1 (scancode→ASCII)
+- [ ] TSS/IST1 for #DF (deferred — Stage 3b)
+- [ ] APIC/LAPIC (deferred — Stage 4b)
 
 ## Stage 4 — Processes & Syscalls
 - [ ] PCB, kernel threads, Ring0/Ring3 transition

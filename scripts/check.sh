@@ -121,6 +121,36 @@ else
     fail "BIOS: Box test failed"
 fi
 
+# ---------------------------------------------------- L5: Stage 3 interrupts --
+section "L5: Stage 3 interrupt subsystem"
+if grep -q "interrupt subsystem online" /tmp/barryos-bios.log; then
+    pass "BIOS: Stage 3 interrupt subsystem online"
+else
+    fail "BIOS: Stage 3 interrupt subsystem not online"
+fi
+if grep -q "IDT loaded (256 entries" /tmp/barryos-bios.log; then
+    pass "BIOS: IDT loaded (256 entries)"
+else
+    fail "BIOS: IDT load missing"
+fi
+if grep -q "PIC remapped" /tmp/barryos-bios.log; then
+    pass "BIOS: PIC remapped (IRQ0..15 → INT 32..47)"
+else
+    fail "BIOS: PIC remap missing"
+fi
+if grep -q "PIT configured" /tmp/barryos-bios.log; then
+    pass "BIOS: PIT configured (100 Hz)"
+else
+    fail "BIOS: PIT config missing"
+fi
+# Verify timer actually ticked (IRQ0 handler ran).
+ticks=$(grep "timer ticks:" /tmp/barryos-bios.log | grep -oE "[0-9]+" | head -1)
+if [ -n "$ticks" ] && [ "$ticks" -gt 0 ] 2>/dev/null; then
+    pass "BIOS: timer interrupts fired (ticks=$ticks)"
+else
+    fail "BIOS: no timer ticks (irq0 handler didn't run)"
+fi
+
 # ---------------------------------------------------------------- summary --
 section "SUMMARY"
 log "PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"

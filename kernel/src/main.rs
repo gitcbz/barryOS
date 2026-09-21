@@ -21,6 +21,7 @@ mod serial;
 mod panic;
 mod bootinfo;
 mod mem;
+mod interrupts;
 
 use core::sync::atomic::Ordering;
 
@@ -40,8 +41,9 @@ pub unsafe extern "C" fn _start() -> ! {
         "and rsp, 0xFFFFFFFFFFFFFFF0",
         "call {main}",
         "cli",
-        "1: hlt",
-        "jmp 1b",
+        "2:",
+        "hlt",
+        "jmp 2b",
         stk = const STACK_TOP,
         main = sym rust_main,
     );
@@ -79,16 +81,24 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
     mem::init(boot_info);
 
     serial::print_str("[stage2] memory subsystem online.\n");
-    serial::print_str("[ok] Stage 2 complete; halting.\n");
+
+    // Stage 3: interrupts (IDT + GDT/TSS + PIC + PIT).
+    serial::print_str("[stage3] initializing interrupt subsystem...\n");
+    interrupts::irq::init_pit();
+    interrupts::init();
+
+    serial::print_str("[stage3] interrupt subsystem online.\n");
+    serial::print_str("[ok] Stage 3 complete; halting.\n");
 
     // VGA summary
     vga::clear();
-    vga::print_str("barryOS booted [Stage 2]\n");
+    vga::print_str("barryOS booted [Stage 3]\n");
     vga::print_str("self-developed x86_64 kernel\n");
     vga::print_str("[boot] path: ");
     vga::print_str(boot_kind);
     vga::print_str("\n");
     vga::print_str("[mem] frame alloc + paging + heap OK\n");
+    vga::print_str("[irq] IDT + PIC + PIT OK\n");
 
     halt_forever();
 }
