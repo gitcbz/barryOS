@@ -1,0 +1,22 @@
+[package]
+name = "barryos-kernel"
+version = "0.1.0"
+edition = "2021"
+authors = ["barryOS project"]
+description = "Self-developed x86_64 kernel (no Linux code)"
+
+[[bin]]
+name = "barryos-kernel"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+debug = true
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+debug = false

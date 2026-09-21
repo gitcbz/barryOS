@@ -1,0 +1,1 @@
+/home/z/my-project/barryOS/kernel/target/x86_64-unknown-none/release/barryos-kernel: /home/z/my-project/barryOS/kernel/src/bootinfo.rs /home/z/my-project/barryOS/kernel/src/main.rs /home/z/my-project/barryOS/kernel/src/panic.rs /home/z/my-project/barryOS/kernel/src/serial.rs /home/z/my-project/barryOS/kernel/src/vga.rs

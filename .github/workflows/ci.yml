@@ -1,0 +1,66 @@
+name: barryOS CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (apt, has sudo on CI runner)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            nasm qemu-system-x86 ovmf xorriso mtools \
+            build-essential clang lld llvm \
+            xxd file
+          sudo curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh
+          sudo sh /tmp/rustup.sh -y --default-toolchain nightly --profile minimal
+          sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/ 2>/dev/null || true
+
+      - name: Setup Rust nightly + components
+        run: |
+          source $HOME/.cargo/env
+          rustup component add rust-src llvm-tools-preview
+          rustup target add x86_64-unknown-none
+          rustc --version; nasm --version; qemu-system-x86_64 --version
+
+      - name: Static checks (cargo fmt + clippy)
+        working-directory: kernel
+        run: |
+          source $HOME/.cargo/env
+          cargo fmt --check
+          cargo clippy --target x86_64-unknown-none -- -D warnings
+
+      - name: Build all artifacts
+        run: make all
+
+      - name: Artifact inspection
+        run: |
+          ls -la build/
+          echo "--- MBR magic ---"; xxd -s 510 -l 2 -p build/mbr.bin
+          echo "--- kernel ELF ---"; readelf -h build/kernel.elf | head -20
+          echo "--- EFI format ---"; file build/BOOTX64.EFI
+
+      - name: Run self-verification (L0-L3)
+        run: bash scripts/check.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: barryOS-artifacts
+          path: |
+            build/*.img
+            build/*.iso
+            build/*.elf
+            build/*.bin
+            build/*.EFI
+            build/logs/
