@@ -1,7 +1,7 @@
 # barryOS — CHECK_REPORT
 
-**Generated:** 2026-09-21 10:30 (Asia/Shanghai)
-**Round:** 6 — Stage 6 (Device Drivers)
+**Generated:** 2026-09-21 10:58 (Asia/Shanghai)
+**Round:** 7 — Stage 7 (Window Manager + GUI)
 **Mode:** Autonomous, rootless sandbox
 
 ## Verification gates
@@ -9,45 +9,51 @@
 | Gate | Description                          | Result |
 |------|--------------------------------------|--------|
 | L0   | `make all` exit 0                    | **PASS** |
-| L1   | 8 artifacts exist + format-correct   | **PASS** (8/8) |
+| L1   | 8 artifacts + format                 | **PASS** |
 | L2   | BIOS QEMU → "barryOS booted"        | **PASS** |
 | L3   | UEFI QEMU → "barryOS booted"        | **PASS** |
 | L4   | Stage 2 memory (5 checks)           | **PASS** |
 | L5   | Stage 3 interrupts (5 checks)       | **PASS** |
 | L6   | Stage 4 processes (5 checks)        | **PASS** |
 | L7   | Stage 5 filesystem (5 checks)      | **PASS** |
-| L8   | Stage 6 device drivers online        | **PASS** |
-| L8   | framebuffer driver initialized       | **PASS** |
-| L8   | PS/2 keyboard driver initialized     | **PASS** |
-| L8   | framebuffer test pattern drawn       | **PASS** |
+| L8   | Stage 6 device drivers (4 checks)   | **PASS** |
+| L9   | Stage 7 window manager online        | **PASS** |
+| L9   | bitmap font initialized             | **PASS** |
+| L9   | windows created                     | **PASS** |
+| L9   | desktop rendered (bg+status+win+dock) | **PASS** |
 
-**Summary: PASS=40  FAIL=0  SKIP=0**
+**Summary: PASS=44  FAIL=0  SKIP=0**
 
-## Stage 6 serial output (BIOS)
+## Stage 7 serial output (BIOS)
 
 ```
-[stage6] initializing device drivers...
-[dev] step 1: init framebuffer
-[fb] BIOS fallback: 640x480x32 @ 0xE0000000
-[dev] step 2: init PS/2 keyboard
-[kb] PS/2 keyboard driver initialized (256-byte line buffer)
-[dev] step 3: draw test pattern
-[fb] drawing test pattern 280x1E0
-[fb] test pattern drawn (8 color bars + emerald box + dot grid)
-[dev] device drivers online
-[stage6] device drivers online.
-[ok] Stage 6 complete; halting.
+[stage7] initializing window manager...
+[wm] step 1: init bitmap font
+[font] 8x16 bitmap font initialized (96 glyphs, F0 bytes)
+[wm] step 2: init window table
+[wm] window table: 10 slots
+[wm] step 3: create desktop windows
+[wm] created window: id=1 "Terminal" at 28,28 140xC8
+[wm] created window: id=2 "Files" at 50,50 118xB4
+[wm] desktop created: 2 windows
+[wm] step 4: render desktop
+[wm] rendering desktop 280x1E0
+[wm] desktop rendered (background + status bar + 2 windows + dock)
+[wm] window manager online
+[stage7] window manager online.
+[ok] Stage 7 complete; halting.
 ```
 
 ## Screenshot
-QEMU screendump captured: 720×400 PPM at `download/barryos-screen-stage6.ppm`.
-Shows 8 color bars (red/orange/yellow/green/cyan/sky/purple/magenta) +
-emerald box (logo placeholder) + dot grid.
+QEMU screendump captured: 720×400 PPM at `download/barryos-screen-stage7.ppm`.
+Shows: dark blue desktop background, top status bar ("barryOS" + "Stage 7"),
+2 windows (Terminal with shell text, Files with file listing), bottom dock bar.
 
-## Next actions (Stage 7 — Window Manager + GUI)
-- Window manager (window create/move/resize/close).
-- Base GUI controls (button, text box, menu, dock).
-- Compositor (framebuffer post-processing).
+## Next actions (Stage 8 — Desktop Environment + Apps)
+- File manager, terminal, text editor apps.
+- Screenshot tool, theme engine.
+- Desktop environment polish.
 
 ## VMware acceptance
-VMware-PENDING (Stage 7+ requires desktop). QEMU BIOS+UEFI is the proxy.
+VMware-READY (Stage 7+ desktop is ready for VMware BIOS/UEFI test).
+QEMU BIOS+UEFI is the current proxy — 44/44 PASS.

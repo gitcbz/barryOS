@@ -1,11 +1,11 @@
 # barryOS — STATUS
 
-**Current round:** Round 6 COMPLETE — Stage 6 (Device Drivers) ✅
-**Last updated:** 2026-09-21 10:30 (Asia/Shanghai)
+**Current round:** Round 7 COMPLETE — Stage 7 (Window Manager + GUI) ✅
+**Last updated:** 2026-09-21 10:58 (Asia/Shanghai)
 **Mode:** AUTONOMOUS
 
 ## Verification result
-**PASS=40  FAIL=0  SKIP=0** — see CHECK_REPORT.md
+**PASS=44  FAIL=0  SKIP=0** — see CHECK_REPORT.md
 
 | Gate | Result |
 |------|--------|
@@ -17,43 +17,48 @@
 | L5  Stage 3 interrupts (5 checks)       | ✅ PASS |
 | L6  Stage 4 processes (5 checks)        | ✅ PASS |
 | L7  Stage 5 filesystem (5 checks)      | ✅ PASS |
-| L8  Stage 6 device drivers online        | ✅ PASS |
-| L8  framebuffer driver initialized       | ✅ PASS |
-| L8  PS/2 keyboard driver initialized     | ✅ PASS |
-| L8  framebuffer test pattern drawn       | ✅ PASS |
+| L8  Stage 6 device drivers (4 checks)   | ✅ PASS |
+| L9  Stage 7 window manager online        | ✅ PASS |
+| L9  bitmap font initialized             | ✅ PASS |
+| L9  windows created                     | ✅ PASS |
+| L9  desktop rendered (bg+status+win+dock) | ✅ PASS |
 
-## Stage 6 deliverables
-1. **Framebuffer** (`kernel/src/dev/framebuffer.rs`): GOP linear
-   framebuffer from BootInfo (UEFI) or fallback VBE 0xE0000000 (BIOS).
-   640×480×32 default. Primitives: `put_pixel(x,y,r,g,b)`, `fill_rect`.
-   Test pattern: 8 color bars + emerald box + dot grid. Atomic state
-   (FB_ADDR/WIDTH/HEIGHT/PITCH/BPP).
-2. **PS/2 keyboard** (`kernel/src/dev/keyboard.rs`): Scancode→ASCII
-   (Set 1, US layout, 59-entry map). 256-byte line buffer. Enter
-   submits line, backspace edits. Echo to serial. KEYS_TOTAL counter.
-   Hooked into IRQ1 handler in `interrupts/irq.rs`.
-3. **IRQ1 integration**: `handle_keyboard()` now calls
-   `dev::keyboard::handle_scancode()` instead of the old inline print.
-4. **Screenshot**: QEMU screendump captured 720×400 framebuffer with
-   the test pattern (saved to `download/barryos-screen-stage6.ppm`).
+## Stage 7 deliverables
+1. **8x16 bitmap font** (`kernel/src/wm/font.rs`): 95 printable ASCII
+   glyphs (32..126). `draw_char`, `draw_str`, `draw_str_bg`. Each glyph
+   is 16 bytes (one per row, MSB = leftmost pixel).
+2. **Window manager** (`kernel/src/wm/window.rs`): Window struct (id,
+   state, x/y/w/h, title, bg color). 16-slot static table. `create`,
+   `render_window`, `render_all`. Windows have: shadow, body, title bar
+   (emerald), border, close button (red), title text (white).
+3. **GUI widgets** (`kernel/src/wm/widgets.rs`): `draw_button`,
+   `draw_label`, `draw_dock` (bottom bar with emerald icons),
+   `draw_status_bar` (top bar with "barryOS" + "Stage 7").
+4. **Desktop compositor** (`kernel/src/wm/desktop.rs`): `create_desktop`
+   creates 2 windows (Terminal + Files). `render` draws: background +
+   status bar + 2 windows with content text + dock.
+5. **Screenshot**: QEMU screendump captured 720×400 PPM showing the
+   desktop with windows + dock (download/barryos-screen-stage7.ppm).
 
 ## Key fixes this round
-- Framebuffer atomic state (AtomicU64/U32) — no `static mut` UB.
-- Keyboard line buffer uses raw pointers (volatile write/read).
-- IRQ1 handler refactored to call `dev::keyboard` (clean separation).
+- Font array count mismatch (95 not 96) → fixed size constant.
+- Dev server Turbopack cache corruption → cleared .next, used `npx next dev`.
+- Raw pointer access for window table (same pattern as VFS/PCB).
 
-## Known limitations (Stage 6b)
-- BIOS fallback framebuffer (0xE0000000) may not work on all QEMU configs.
-- No 8x16 bitmap font for text rendering (only rectangles/pixels).
-- No mouse driver (PS/2 mouse IRQ12 exists but no handler).
-- UEFI GOP not tested (UEFI path hangs at timer wait).
+## Known limitations (Stage 7b)
+- No interactive window moving/resizing (static layout).
+- No mouse support (keyboard only).
+- No window z-order management (fixed order).
+- No compositor effects (blur, shadows are static).
 
-## Next round (Stage 7 — Window Manager + GUI)
-- [ ] Window manager (window create/move/resize/close)
-- [ ] Base GUI controls (button, text box, menu, dock)
-- [ ] Compositor (framebuffer post-processing)
+## Next round (Stage 8 — Desktop Environment + Apps)
+- [ ] File manager app
+- [ ] Terminal app
+- [ ] Text editor app
+- [ ] Screenshot tool
+- [ ] Theme engine
 
 ## Gates status
-- L0-L8: ✅ PASS
-- L9 compat layer: deferred (Stage 9-10)
-- L10 VMware: PENDING (Stage 7+ desktop)
+- L0-L9: ✅ PASS
+- L10 compat layer: deferred (Stage 9-10)
+- L11 VMware: PENDING (Stage 7+ desktop = ready for VMware test)

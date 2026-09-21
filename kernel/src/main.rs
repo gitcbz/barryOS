@@ -25,6 +25,7 @@ mod interrupts;
 mod proc;
 mod fs;
 mod dev;
+mod wm;
 
 use core::sync::atomic::Ordering;
 
@@ -111,16 +112,22 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
 
     serial::print_str("[stage6] device drivers online.\n");
 
+    // Stage 7: window manager + GUI.
+    serial::print_str("[stage7] initializing window manager...\n");
+    wm::init();
+
+    serial::print_str("[stage7] window manager online.\n");
+
     // Print final diagnostics.
     proc::process::print_table();
     proc::scheduler::print_stats();
     fs::vfs::print_table();
 
-    serial::print_str("[ok] Stage 6 complete; halting.\n");
+    serial::print_str("[ok] Stage 7 complete; halting.\n");
 
     // VGA summary
     vga::clear();
-    vga::print_str("barryOS booted [Stage 6]\n");
+    vga::print_str("barryOS booted [Stage 7]\n");
     vga::print_str("self-developed x86_64 kernel\n");
     vga::print_str("[boot] path: ");
     vga::print_str(boot_kind);
@@ -130,6 +137,7 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
     vga::print_str("[proc] PCB + scheduler + syscall OK\n");
     vga::print_str("[fs] VFS + RAMfs OK\n");
     vga::print_str("[dev] framebuffer + keyboard OK\n");
+    vga::print_str("[wm] windows + font + dock OK\n");
 
     halt_forever();
 }

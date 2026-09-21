@@ -230,6 +230,29 @@ else
     fail "BIOS: framebuffer test pattern missing"
 fi
 
+# ---------------------------------------------------- L9: Stage 7 window manager --
+section "L9: Stage 7 window manager"
+if grep -aq "window manager online" /tmp/barryos-bios.log; then
+    pass "BIOS: Stage 7 window manager online"
+else
+    fail "BIOS: Stage 7 window manager not online"
+fi
+if grep -aq "bitmap font initialized" /tmp/barryos-bios.log; then
+    pass "BIOS: bitmap font initialized"
+else
+    fail "BIOS: bitmap font missing"
+fi
+if grep -aq "created window" /tmp/barryos-bios.log; then
+    pass "BIOS: windows created"
+else
+    fail "BIOS: window creation missing"
+fi
+if grep -aq "desktop rendered" /tmp/barryos-bios.log; then
+    pass "BIOS: desktop rendered (background + status + windows + dock)"
+else
+    fail "BIOS: desktop render missing"
+fi
+
 # ---------------------------------------------------------------- summary --
 section "SUMMARY"
 log "PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"
