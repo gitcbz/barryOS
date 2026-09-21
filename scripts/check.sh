@@ -179,6 +179,34 @@ else
     fail "BIOS: syscall test missing"
 fi
 
+# ---------------------------------------------------- L7: Stage 5 filesystem --
+section "L7: Stage 5 filesystem subsystem"
+if grep -aq "filesystem subsystem online" /tmp/barryos-bios.log; then
+    pass "BIOS: Stage 5 filesystem subsystem online"
+else
+    fail "BIOS: Stage 5 filesystem not online"
+fi
+if grep -aq "VFS initialized" /tmp/barryos-bios.log; then
+    pass "BIOS: VFS initialized (vnode table)"
+else
+    fail "BIOS: VFS init missing"
+fi
+if grep -aq "RAM filesystem initialized" /tmp/barryos-bios.log; then
+    pass "BIOS: RAM filesystem initialized"
+else
+    fail "BIOS: RAM filesystem init missing"
+fi
+if grep -aq "root directory" /tmp/barryos-bios.log; then
+    pass "BIOS: root directory listing works"
+else
+    fail "BIOS: root directory listing missing"
+fi
+if grep -aq "read.*bytes" /tmp/barryos-bios.log; then
+    pass "BIOS: file read works (open+read+close)"
+else
+    fail "BIOS: file read test missing"
+fi
+
 # ---------------------------------------------------------------- summary --
 section "SUMMARY"
 log "PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"

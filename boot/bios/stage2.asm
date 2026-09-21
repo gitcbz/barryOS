@@ -20,7 +20,7 @@
 [org 0x7E00]
 
 KERNEL_DISK_LBA    equ 32            ; kernel.bin starts at LBA 32
-KERNEL_SECTORS     equ 128           ; 64 KiB max kernel size for stage 1
+KERNEL_SECTORS     equ 256           ; 128 KiB max kernel size for stage 1
 KERNEL_BUF_SEG     equ 0x1000       ; buffer segment  → linear 0x10000
 KERNEL_BUF_OFF     equ 0x0000
 KERNEL_BUF_LINEAR  equ 0x00010000
@@ -40,12 +40,24 @@ stage2_start:
     mov si, msg_loading
     call print16
 
-    ; --- load kernel.bin to 0x1000:0000 (= linear 0x10000) ---
-    mov si, dap_kernel
-    mov ah, 0x42
-    mov dl, [boot_drive]
-    int 0x13
-    jc disk_err
+    ; --- load kernel.bin to buffer (128 KiB in 4 chunks of 64 sectors) ---
+    ; Chunk 1: LBA 32, 64 sectors → seg 0x1000
+    %macro READ_CHUNK 3
+        mov word [dap_kernel + 2], %1
+        mov word [dap_kernel + 4], 0
+        mov word [dap_kernel + 6], %2
+        mov dword [dap_kernel + 8], %3
+        mov dword [dap_kernel + 12], 0
+        mov si, dap_kernel
+        mov ah, 0x42
+        mov dl, [boot_drive]
+        int 0x13
+        jc disk_err
+    %endmacro
+    READ_CHUNK 64, 0x1000, 32
+    READ_CHUNK 64, 0x1800, 96
+    READ_CHUNK 64, 0x2000, 160
+    READ_CHUNK 64, 0x2800, 224
 
     ; --- enable A20 (fast method via port 0x92) ---
     in  al, 0x92

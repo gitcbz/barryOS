@@ -54,7 +54,7 @@ Checked items `[x]` are complete. See STATUS.md for current round.
 - [ ] Actual preemptive context switch (deferred — Stage 4b)
 - [ ] Ring 0 → Ring 3 user-mode (deferred — Stage 4b)
 
-## Stage 5 — VFS + Filesystem + Block Driver
+## Stage 5 — VFS + Filesystem ✅
 - [ ] VFS (inode/dentry/file/superblock)
 - [ ] Simple FS (FAT32 or self-made)
 - [ ] ATA-PIO or AHCI block driver
