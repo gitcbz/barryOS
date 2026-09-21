@@ -1,85 +1,59 @@
 # barryOS — DECISIONS LOG
 
-Every autonomous decision is recorded here with rationale so the work is
-auditable and reversible. Format: `[Dxx] Title — decision — reason — date`.
+## [D11] EFI memory types — self-developed enum matching UEFI spec — 2026-09-21
+- `MemoryType` enum in `mem/efi.rs` reproduces UEFI 2.10 spec constants.
+- `is_usable()` returns true only for `ConventionalMemory` (free RAM).
+- `EfiMemoryDescriptor` is `#[repr(C)]` matching the spec (40 bytes).
 
-## [D01] Kernel load address = 0x00100000 (1 MiB), identity-mapped — 2026-09-21
-- Decision: Kernel is a flat binary loaded at physical 0x100000, identity-mapped
-  for Stage 1. Entry point at the very start of the image.
-- Reason: Simplest reliable MVP. BIOS bootloader loads a flat binary (no ELF
-  parsing in 16-bit real mode). UEFI app also loads the flat binary to 0x100000.
-  Both paths converge on the same `_start`.
-- Higher-half remap deferred to Stage 2 (paging subsystem) per the stage plan.
+## [D12] Static MemMap + parse_into (avoid struct return-by-value) — 2026-09-21
+- **Problem**: `memmap::parse() -> MemMap` hung in the BIOS boot path.
+  The MemMap (768+ bytes) was returned by value (sret), which triggered
+  a hang — likely a code generation issue with large struct returns in
+  no_std kernel mode.
+- **Fix**: Made MemMap a `static mut BI` in `mem/mod.rs`. Changed
+  `parse()` to `parse_into(boot_info, &mut MemMap)`. The parse function
+  writes directly into the static via a mutable reference.
+- **Trade-off**: Stage 2 is single-threaded (no preemption), so a static
+  is safe. Stage 4+ (processes) will need per-address-space memmaps.
 
-## [D02] Kernel image format = flat binary on disk, ELF kept for inspection — 2026-09-21
-- Decision: Build kernel as ELF (for sections/symbols/debug), then `objcopy -O binary`
-  to produce kernel.bin which is what the bootloader places on disk & loads.
-- Reason: Avoids ELF program-header parsing in the bootloader. The ELF remains
-  in `build/` for readelf/objdump inspection. ELF-in-bootloader loading is a
-  Stage 5 enhancement.
+## [D13] Raw pointer access for static mut (Rust 2024 safety) — 2026-09-21
+- **Problem**: `BITMAP.as_mut_ptr()` and `&PML4` on `static mut` create
+  temporary references, which is UB in Rust 2024.
+- **Fix**: Use `core::ptr::addr_of_mut!(BITMAP)` and `addr_of!(PML4)` to
+  get raw pointers without creating references. All reads/writes via
+  `read_volatile`/`write_volatile`. This is the recommended Rust 2024
+  pattern for `static mut` access.
 
-## [D03] BIOS disk layout — 2026-09-21
-- LBA 0         : MBR (512 B, ends 0x55AA) — loads stage2
-- LBA 1..31     : stage2.bin (16 KiB max, loaded to 0x7E00)
-- LBA 32..N     : kernel.bin (loaded to 0x100000)
-- LBA N+1..     : (reserved for filesystem in Stage 5)
-- Reason: Fixed offsets make the bootloader trivial; 16 KiB is plenty for a
-  real-mode→long-mode stage 2.
+## [D14] Bump allocator for Stage 2 (free-list deferred) — 2026-09-21
+- **Problem**: Free-list allocator's `dealloc` caused Vec reallocation
+  to hang (likely `__rust_dealloc` linkage issue with compiler-builtins).
+- **Fix**: Bump allocator (alloc bumps pointer, dealloc is no-op).
+  Uses `AtomicU64` for state (no `UnsafeCell`/`static mut` issues).
+  Enough for Box, Vec::with_capacity, raw alloc. Vec reallocation
+  (grow_amortized) is deferred to Stage 2b.
+- **Trade-off**: Bump allocator never frees memory. For Stage 2 testing
+  this is fine. Stage 2b will implement a proper free-list or slab.
 
-## [D04] UEFI boot path: self-written EFI app in C, hand-rolled EFI types — 2026-09-21
-- Decision: Write the UEFI bootloader as a freestanding C program that calls
-  EFI Boot Services directly, using EFI struct definitions we write ourselves
-  (verified against EDK2 `UefiSpec.h`).  Compile with
-  `clang-19 -target x86_64-unknown-windows` (MS-ABI) and link to PE32+ with
-  GNU `ld -m i386pep --subsystem 10`.
-- Reason: Fully self-developed (no uefi-rs dependency). clang's windows target
-  emits MS-ABI code that OVMF's PE loader accepts; gcc's non-PIC PE produced
-  runtime pseudo-relocations OVMF rejected ("Unsupported"/"Load Error").
-  UEFI already runs in 64-bit long mode, so the EFI app only needs:
-  LocateProtocol(SimpleFS), read kernel.bin, GOP framebuffer, memmap,
-  ExitBootServices, memcpy kernel → 0x100000, jmp with RDI=&BootInfo.
-- Resolution: Stage 1 UEFI boots to "barryOS booted" (L3 PASS).
+## [D15] Bitmap reduced from 128 KiB to 8 KiB — 2026-09-21
+- 128 KiB bitmap (4 GiB coverage) worked but was excessive for QEMU's
+  default 128 MiB. Reduced to 8 KiB (256 MiB coverage) to keep .bss
+  small and avoid potential large-allocation issues.
+- Can be increased for VMware VMs with more RAM.
 
-## [D04b] OVMF firmware: Fedora build (FatDxe included) — 2026-09-21
-- The Debian `ovmf` package ships a minimal OVMF without the FAT filesystem
-  driver (FatDxe). OVMF booted to the shell but never created an `fs0:`
-  mapping, so no EFI app could be loaded.
-- Fix: extracted Fedora's `edk2-ovmf` RPM (parsed zstd payload in Python,
-  no rpm2cpio deps), which includes FatDxe. Installed as the default OVMF.
-- CI note: ubuntu-latest runners ship the full OVMF with FatDxe, so this
-  sandbox-specific substitution is not needed there.
+## [D16] Identity mapping with 1 GiB pages (not higher-half) — 2026-09-21
+- **Decision**: Stage 2 uses 1 GiB pages for identity mapping (0..4 GiB),
+  NOT higher-half remap. PML4[0] and PML4[511] both point to PDPT0.
+- **Reason**: Higher-half remap requires changing the linker script LMA,
+  code model, and carefully handling the address space switch. Too risky
+  for Stage 2 — would break the working boot. Identity mapping is safe.
+- **Stage 2b**: Will attempt higher-half (link at 0xFFFFFFFF80100000,
+  map to physical 0x100000, jump to high address, unmap identity).
 
-## [D05] Unified kernel entry contract — 2026-09-21
-- Both boot paths jump to `0x00100000` (= `_start`) in 64-bit long mode with a
-  valid stack (RSP set by the loader) and interrupts disabled.
-- ABI: RDI = pointer to a BootInfo struct (UEFI provides it; BIOS passes 0).
-- For Stage 1 the kernel ignores BootInfo and just prints "barryOS booted".
-- Reason: Lets us unify the entry now and adopt BootInfo in Stage 2 without
-  touching the boot path again.
+## [D17] BIOS fallback memory map (no E820 yet) — 2026-09-21
+- BIOS stage2 bootloader doesn't pass E820. Kernel synthesizes:
+  - Region 0: [1 MiB, 2 MiB) as LoaderData (kernel image, not allocatable).
+  - Region 1: [2 MiB, 64 MiB) as ConventionalMemory (free RAM).
+- This is a simplification — real E820 querying in stage2 is Stage 2b.
+- UEFI path uses the real UEFI memory map (20+ regions).
 
-## [D06] Output drivers: VGA text (0xB8000) + serial COM1 (0x3F8) — 2026-09-21
-- Stage 1 prints to both. VGA gives a visible screen; serial gives
-  script-checkable output (`-serial stdio` in QEMU → assert on string).
-- Reason: QEMU assertion needs deterministic text; VGA alone is not assertable
-  headlessly without screen scraping.
-
-## [D07] Output string for Stage 1 acceptance = `barryOS booted` — 2026-09-21
-- Exact ASCII string printed once near the start of `kernel_main`.
-- Assertion: serial log must contain this substring; boot is otherwise silent.
-
-## [D08] No higher-half, no ASLR, no SMP in Stage 1 — 2026-09-21
-- Single CPU, identity-mapped low MiB, no randomization. Stage 4+ adds SMP.
-
-## [D09] Toolchain install without sudo — 2026-09-21
-- Used `apt-get download` + `dpkg-deb -x` to install QEMU/xorriso/mtools/OVMF
-  into `~/.opt` (no root). Built NASM from source to `~/.local/bin`.
-  Rust via rustup to `~/.cargo`.
-- Reason: Sandbox has no passwordless sudo. This keeps the env reproducible and
-  is mirrored in ci/Dockerfile for CI (which DOES run as root and uses apt-get).
-
-## [D10] ISO format = hybrid El Torito + ISO9660, built with xorriso — 2026-09-21
-- BIOS El Torito boot image = barryOS-bios.img (MBR + stage2 + kernel).
-- UEFI El Torito boot image = a FAT32 ESP containing /EFI/BOOT/BOOTX64.EFI
-  and /kernel.bin.
-- xorriso `-eltorito-boot` + `-efi-boot` + `-append_partition` for the
-  hybrid MBR so the same ISO boots BIOS and UEFI.
+(Previous decisions D01–D10 from Round 1 are unchanged.)

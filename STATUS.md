@@ -1,60 +1,64 @@
 # barryOS — STATUS
 
-**Current round:** Round 1 COMPLETE — Stage 0 + Stage 1 (Dual-Boot MVP) ✅
-**Last updated:** 2026-09-21 06:01 (Asia/Shanghai)
-**Mode:** AUTONOMOUS (no human confirmation; self-verify with QEMU)
+**Current round:** Round 2 COMPLETE — Stage 2 (Memory Management) ✅
+**Last updated:** 2026-09-21 06:58 (Asia/Shanghai)
+**Mode:** AUTONOMOUS
 
-## Verification result (this round)
-**PASS=16  FAIL=0  SKIP=0** — see CHECK_REPORT.md
+## Verification result
+**PASS=21  FAIL=0  SKIP=0** — see CHECK_REPORT.md
 
 | Gate | Result |
 |------|--------|
 | L0  make all                            | ✅ PASS |
-| L1  8 artifacts exist + format-correct | ✅ PASS (8/8) |
+| L1  8/8 artifacts + format              | ✅ PASS |
 | L1b MBR magic 0x55AA                    | ✅ PASS |
 | L1c kernel ELF x86-64                   | ✅ PASS |
-| L1d BOOTX64.EFI = PE32+ EFI app         | ✅ PASS |
+| L1d BOOTX64.EFI PE32+                   | ✅ PASS |
 | L1e stage2 = 15872 bytes                | ✅ PASS |
 | L2  BIOS QEMU → "barryOS booted"        | ✅ PASS |
 | L3  UEFI QEMU → "barryOS booted"        | ✅ PASS |
+| L4  Stage 2 memory subsystem online     | ✅ PASS |
+| L4  CR3 switched (own page tables)      | ✅ PASS |
+| L4  heap alloc+write+read OK            | ✅ PASS |
+| L4  Vec::with_capacity works            | ✅ PASS |
+| L4  Box::new works                      | ✅ PASS |
 
-Both boot paths converge on the same 64-bit kernel entry at 0x100000 and
-print `barryOS booted` to COM1 serial + VGA text. Stage 1 is done.
-
-## Environment
-- Host: Linux 5.10 x86_64, user `z`, workdir `/home/z/my-project`
-- Toolchain (all rootless, see BOOTSTRAP.md):
-  - rustc 1.100.0-nightly (x86_64-unknown-none + llvm-tools + rust-src)
-  - nasm 2.16.01 (built from source → ~/.local/bin)
-  - clang-19 19.1.7 + gcc 14.2.0 + ld 2.44
-  - qemu-system-x86_64 10.0.13, xorriso 1.5.6, mtools 4.0.48, mkfs.fat 4.2
-  - OVMF: Fedora edk2-ovmf 20240813 (includes FatDxe — Debian's does NOT)
-  - SeaBIOS: bundled with qemu, exposed via unified firmware dir
+## Stage 2 deliverables
+1. **BootInfo consumption** (`mem/memmap.rs`): parses UEFI memory map from
+   BootInfo, or synthesizes BIOS fallback (2 regions: kernel + 62 MiB free).
+2. **Physical frame allocator** (`mem/frame_alloc.rs`): bitmap-based, 8 KiB
+   bitmap covering 256 MiB. Volatile raw-pointer access (avoids Rust 2024
+   `static mut` reference UB).
+3. **x86_64 page tables** (`mem/paging.rs`): kernel owns its PML4+PDPT,
+   CR3 switched from bootloader's tables to ours. 4 GiB identity-mapped
+   with 1 GiB pages. PML4[0] + PML4[511] both → PDPT0.
+4. **Heap allocator** (`mem/heap.rs`): bump allocator registered as
+   `#[global_allocator]`. 1 MiB heap (256 frames). Supports raw alloc,
+   Box, Vec::with_capacity. Vec reallocation deferred to Stage 2b.
+5. **EFI types** (`mem/efi.rs`): MemoryType enum + EfiMemoryDescriptor.
 
 ## Key fixes this round
-1. Rootless toolchain install (apt .deb extract + source builds).
-2. BIOS chain: MBR(512B) → stage2(16K) → long mode → kernel @ 0x100000.
-3. UEFI loader in C with hand-written EFI types (verified against EDK2 UefiSpec.h).
-4. clang `-target x86_64-unknown-windows` produces MS-ABI PE OVMF accepts.
-5. EFI app loads kernel.bin via LocateProtocol(SimpleFS), allocates buffer,
-   ExitBootServices, memcpy to 0x100000, jumps with RDI=&BootInfo.
-6. FAT16 ESP (16 MiB) — OVMF binds its FatDxe driver reliably.
-7. Hybrid ISO: El Torito BIOS entry + UEFI boot image + appended partition.
+- Static MemMap (avoids large struct return-by-value hang in BIOS path).
+- Raw pointer access for `static mut BITMAP` (Rust 2024 safety).
+- Bump allocator instead of free-list (simpler, avoids dealloc issues).
+- `core::ptr::copy_nonoverlapping` verified working (memcpy linked).
+- Makefile wildcard fixed to track `src/**/*.rs` (was `src/*.rs`).
 
-## Next round (Stage 2 — Memory Management)
-- [ ] Physical page frame allocator (bitmap) over UEFI memmap / E820.
-- [ ] x86_64 4-level page tables, higher-half kernel remap.
-- [ ] Buddy/slab heap allocator with `#[global_allocator]`.
-- [ ] Consume BootInfo (framebuffer + memmap) in kernel.
+## Known limitations (Stage 2b)
+- Vec reallocation (grow_amortized) hangs — likely `__rust_dealloc` linkage.
+- Higher-half kernel remap not yet done (needs linker script + code model).
+- No interrupt handling yet (Stage 3) — panics triple-fault silently.
+
+## Next round (Stage 3 — Interrupts & Exceptions)
+- [ ] IDT setup, CPU exception handlers (#PF, #GP, #UD, #DF)
+- [ ] PIC remap + IRQ handlers
+- [ ] PIT/HPET clock tick
+- [ ] Panic → framebuffer + serial dump (instead of silent triple fault)
 
 ## Gates status
-- L0 make ok — ✅ PASS
-- L1 artifacts exist + format-correct — ✅ PASS
-- L2 BIOS QEMU prints "barryOS booted" — ✅ PASS
-- L3 UEFI QEMU prints "barryOS booted" — ✅ PASS
-- L4 kernel unit tests — deferred (Stage 2+)
-- L5 userland hello world — deferred (Stage 4)
-- L6 fs read/write — deferred (Stage 5)
-- L7 graphics frame — deferred (Stage 6)
-- L8 compat layer samples — deferred (Stage 9-10)
-- L9 VMware BIOS/UEFI boot to desktop — VMware-PENDING (Stage 7+)
+- L0-L4: ✅ PASS
+- L5 userland hello: deferred (Stage 4)
+- L6 fs read/write: deferred (Stage 5)
+- L7 graphics frame: deferred (Stage 6)
+- L8 compat layer: deferred (Stage 9-10)
+- L9 VMware: PENDING (Stage 7+)

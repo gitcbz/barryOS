@@ -93,6 +93,34 @@ else
 fi
 cp /tmp/barryos-uefi.log build/logs/qemu-uefi.log
 
+# ---------------------------------------------------- L4: Stage 2 memory --
+section "L4: Stage 2 memory subsystem"
+if grep -q "memory subsystem online" /tmp/barryos-bios.log; then
+    pass "BIOS: Stage 2 memory subsystem online"
+else
+    fail "BIOS: Stage 2 memory subsystem not online"
+fi
+if grep -q "CR3 0x" /tmp/barryos-bios.log; then
+    pass "BIOS: CR3 switched (own page tables)"
+else
+    fail "BIOS: CR3 switch missing"
+fi
+if grep -q "heap test 1: val=0x123456789ABCDEF0 OK" /tmp/barryos-bios.log; then
+    pass "BIOS: heap alloc+write+read OK"
+else
+    fail "BIOS: heap smoke test failed"
+fi
+if grep -q "Vec with_capacity" /tmp/barryos-bios.log; then
+    pass "BIOS: Vec::with_capacity works"
+else
+    fail "BIOS: Vec test missing"
+fi
+if grep -q "Box=0xDEADBEEF OK" /tmp/barryos-bios.log; then
+    pass "BIOS: Box::new works"
+else
+    fail "BIOS: Box test failed"
+fi
+
 # ---------------------------------------------------------------- summary --
 section "SUMMARY"
 log "PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"

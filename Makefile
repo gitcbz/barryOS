@@ -65,7 +65,7 @@ help:
 # ---------------------------------------------------------------------------
 kernel: $(KERN_ELF) $(KERN_BIN)
 
-$(KERN_ELF): $(wildcard $(KERN_DIR)/src/*.rs) $(KERN_DIR)/Cargo.toml $(KERN_DIR)/linker.ld $(KERN_DIR)/.cargo/config.toml
+$(KERN_ELF): $(shell find $(KERN_DIR)/src -name '*.rs') $(KERN_DIR)/Cargo.toml $(KERN_DIR)/linker.ld $(KERN_DIR)/.cargo/config.toml
 	@mkdir -p $(BUILD)
 	cd $(KERN_DIR) && RUSTFLAGS="-C link-arg=-T$(KERN_DIR)/linker.ld" $(CARGO) build $(KERN_PROFILE_FLAG) --target $(TARGET)
 	@cp $(KERN_DIR)/target/$(TARGET)/$(PROFILE)/barryos-kernel $(KERN_ELF)

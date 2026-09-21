@@ -10,7 +10,8 @@ Checked items `[x]` are complete. See STATUS.md for current round.
 - [x] Write state files (STATUS/TODO/CHANGELOG/DECISIONS/ASSUMPTION/BOOTSTRAP/BLOCKERS)
 - [x] Write docs/ARCHITECTURE.md (dual-boot chain, kernel, userland, desktop, compat layers)
 
-## Stage 1 — Dual-Boot MVP
+## Stage 1 — Dual-Boot MVP ✅
+- [x] all items complete (Round 1)
 - [x] BIOS MBR bootloader (512 B, 0x55AA, loads stage2)
 - [x] BIOS stage2 bootloader (real→protected→long mode, loads kernel to 0x100000)
 - [x] UEFI EFI application (GOP framebuffer, memmap, ExitBootServices, jump to kernel)
@@ -26,11 +27,14 @@ Checked items `[x]` are complete. See STATUS.md for current round.
 - [x] Rootless toolchain (Rust nightly, NASM, QEMU, xorriso, mtools, OVMF, clang)
 - [x] Fedora OVMF (has FatDxe) extracted from RPM and installed
 
-## Stage 2 — Memory Management (NEXT ROUND)
-- [ ] Physical page frame allocator (bitmap over UEFI memmap / E820)
-- [ ] x86_64 4-level page tables, higher-half kernel remap
-- [ ] Buddy or linked-list kernel heap + GlobalAlloc impl
-- [ ] Pass boot info (memmap, framebuffer) from bootloader → kernel
+## Stage 2 — Memory Management ✅
+- [x] BootInfo consumption (UEFI memmap + BIOS fallback)
+- [x] Physical page frame allocator (bitmap, 8 KiB / 256 MiB)
+- [x] x86_64 4-level page tables + CR3 switch (1 GiB identity map)
+- [x] Heap allocator (bump, #[global_allocator], Box/Vec work)
+- [ ] Vec reallocation (deferred to Stage 2b)
+- [ ] Higher-half kernel remap (deferred to Stage 2b)
+
 
 ## Stage 3 — Interrupts & Exceptions
 - [ ] IDT setup, CPU exception handlers (#PF, #GP, #UD, #DF)

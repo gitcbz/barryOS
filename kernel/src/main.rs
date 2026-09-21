@@ -1,4 +1,4 @@
-//! barryOS kernel — Stage 1 entry point.
+//! barryOS kernel — Stage 2 entry point.
 //!
 //! Loaded at physical 0x00100000 by either:
 //!   * the BIOS stage-2 bootloader (real -> protected -> long mode), or
@@ -7,16 +7,20 @@
 //! Both arrive in 64-bit long mode with interrupts off, a valid stack at
 //! 0x00200000, and RDI = pointer to a `BootInfo` struct (NULL on BIOS).
 //!
-//! Stage 1 goal: print `barryOS booted` to the serial port (COM1) and to
-//! the 80x25 VGA text framebuffer, then halt cleanly.
+//! Stage 2 goal: boot to `barryOS booted`, then initialize the memory
+//! subsystem (frame allocator, paging, heap) and prove it works.
 
 #![no_std]
 #![no_main]
+
+// Enable the `alloc` crate so Vec/Box work in no_std.
+extern crate alloc;
 
 mod vga;
 mod serial;
 mod panic;
 mod bootinfo;
+mod mem;
 
 use core::sync::atomic::Ordering;
 
@@ -24,8 +28,7 @@ use core::sync::atomic::Ordering;
 const STACK_TOP: usize = 0x0020_0000;
 
 /// Naked entry. Placed in `.text.entry` so the linker script puts it first.
-/// RDI holds the BootInfo pointer (NULL on BIOS).  We hand it off to
-/// `rust_main` as the System-V first argument register.
+/// RDI holds the BootInfo pointer (NULL on BIOS).
 #[unsafe(naked)]
 #[link_section = ".text.entry"]
 #[no_mangle]
@@ -34,7 +37,7 @@ pub unsafe extern "C" fn _start() -> ! {
         "cli",
         "mov rsp, {stk}",
         "xor rbp, rbp",
-        "and rsp, 0xFFFFFFFFFFFFFFF0",   // 16-byte align
+        "and rsp, 0xFFFFFFFFFFFFFFF0",
         "call {main}",
         "cli",
         "1: hlt",
@@ -70,14 +73,22 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
     serial::print_hex(KERNEL_LOAD as u64);
     serial::print_str("\n");
     serial::print_str("barryOS booted\n");
-    serial::print_str("[ok] Stage 1 complete; halting.\n");
+    serial::print_str("[stage2] initializing memory subsystem...\n");
 
+    // Initialize the memory subsystem (frame allocator + paging + heap).
+    mem::init(boot_info);
+
+    serial::print_str("[stage2] memory subsystem online.\n");
+    serial::print_str("[ok] Stage 2 complete; halting.\n");
+
+    // VGA summary
     vga::clear();
-    vga::print_str("barryOS booted\n");
+    vga::print_str("barryOS booted [Stage 2]\n");
     vga::print_str("self-developed x86_64 kernel\n");
-    vga::print_str("[Stage 1] boot path: ");
+    vga::print_str("[boot] path: ");
     vga::print_str(boot_kind);
     vga::print_str("\n");
+    vga::print_str("[mem] frame alloc + paging + heap OK\n");
 
     halt_forever();
 }
