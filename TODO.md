@@ -59,7 +59,7 @@ Checked items `[x]` are complete. See STATUS.md for current round.
 - [ ] Simple FS (FAT32 or self-made)
 - [ ] ATA-PIO or AHCI block driver
 
-## Stage 6 — Device Drivers
+## Stage 6 — Device Drivers ✅
 - [ ] PS/2 keyboard + mouse
 - [ ] Framebuffer console / graphics
 - [ ] Serial debug

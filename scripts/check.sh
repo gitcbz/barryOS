@@ -207,6 +207,29 @@ else
     fail "BIOS: file read test missing"
 fi
 
+# ---------------------------------------------------- L8: Stage 6 device drivers --
+section "L8: Stage 6 device drivers"
+if grep -aq "device drivers online" /tmp/barryos-bios.log; then
+    pass "BIOS: Stage 6 device drivers online"
+else
+    fail "BIOS: Stage 6 device drivers not online"
+fi
+if grep -aq "framebuffer" /tmp/barryos-bios.log; then
+    pass "BIOS: framebuffer driver initialized"
+else
+    fail "BIOS: framebuffer init missing"
+fi
+if grep -aq "PS/2 keyboard" /tmp/barryos-bios.log; then
+    pass "BIOS: PS/2 keyboard driver initialized"
+else
+    fail "BIOS: keyboard init missing"
+fi
+if grep -aq "test pattern drawn" /tmp/barryos-bios.log; then
+    pass "BIOS: framebuffer test pattern drawn"
+else
+    fail "BIOS: framebuffer test pattern missing"
+fi
+
 # ---------------------------------------------------------------- summary --
 section "SUMMARY"
 log "PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"

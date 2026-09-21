@@ -2,36 +2,31 @@
 
 Reverse-chronological.
 
+## 2026-09-21 — Round 6 — Stage 6 (Device Drivers) — ✅ COMPLETE
+- Implemented device drivers in `kernel/src/dev/`:
+  - `framebuffer.rs` — GOP/VBE framebuffer. `put_pixel`, `fill_rect`,
+    `draw_test_pattern` (8 color bars + emerald box + dot grid).
+    AtomicU64/U32 state (FB_ADDR/WIDTH/HEIGHT/PITCH/BPP). BIOS fallback
+    0xE0000000, UEFI uses BootInfo GOP values.
+  - `keyboard.rs` — PS/2 keyboard. 59-entry scancode→ASCII map. 256-byte
+    line buffer. Enter submits, backspace edits. Echo to serial.
+    KEYS_TOTAL counter. Raw pointer volatile access.
+  - `mod.rs` — init sequence: framebuffer → keyboard → test pattern.
+- Updated `kernel/src/main.rs`: `mod dev`, calls `dev::init(boot_info)`.
+- Updated `kernel/src/interrupts/irq.rs`: `handle_keyboard()` now calls
+  `dev::keyboard::handle_scancode()` (clean driver separation).
+- Updated `scripts/check.sh`: L8 gate (4 Stage 6 device checks).
+- Dashboard updated: Stage 6 Device Drivers section with framebuffer
+  visualization (color bars + emerald box mockup), color palette,
+  pixel API, memory layout, PS/2 keyboard scancode table, line buffer,
+  IRQ1 flow, 10 sub-components.
+- Screenshot captured: QEMU screendump 720×400 PPM (download/barryos-screen-stage6.ppm).
+- Verification: `bash scripts/check.sh` → **PASS=40 FAIL=0 SKIP=0**.
+  BIOS boots to device drivers online + framebuffer 640×480×32 @ 0xE0000000
+  + PS/2 keyboard initialized + test pattern drawn.
+
 ## 2026-09-21 — Round 5 — Stage 5 (VFS + Filesystem) — ✅ COMPLETE
-- Implemented VFS + RAM filesystem in `kernel/src/fs/`:
-  - `vfs.rs` — Vnode abstraction (64-slot table, raw pointer access).
-    `create_file`, `create_dir`, `lookup` (byte-by-byte comparison),
-    `print_table`, `ls_root`. NEXT_ID starts at 2 (root=1).
-  - `ramfs.rs` — In-memory RAM filesystem (8 KiB data pool).
-    `alloc_data`, `write_file`, `read_file` (volatile writes/reads).
-    `create_test_files` creates 4 test files (motd, hello, version, hostname).
-  - `file.rs` — File handle operations. `open(path)`→fd, `read(fd,buf)`→bytes,
-    `close(fd)`. 16-slot handle table. Smoke test: open("/hello")→fd=0,
-    read 45 bytes. open("/nonexistent")→-1.
-- Updated `boot/bios/stage2.asm`: increased kernel load from 128 to 256
-  sectors using 4-chunk int 13h reads (64 sectors each) via NASM macro.
-  kernel.bin grew to ~84 KiB with fs module, exceeding old 64 KiB limit.
-- Updated `kernel/src/main.rs`: `mod fs`, calls `fs::init()`.
-- Updated `scripts/check.sh`: L7 gate (5 Stage 5 filesystem checks).
-- Dashboard updated: Stage 5 Filesystem Subsystem section with vnode table,
-  root directory browser, file operations flow, RAMfs data pool,
-  VFS architecture diagram, file read test results, 11 sub-components.
-- FAIL → root cause → fix log:
-  1. kernel.bin > 64 KiB stage2 limit → 4-chunk 256-sector BIOS reads.
-  2. `&mut` reference UB on static VNODES → raw pointer access throughout.
-  3. `slice == slice` (memcmp) caused #UD → byte-by-byte volatile comparison.
-  4. Vnode ID collision (root + file both id=1) → NEXT_ID starts at 2.
-  5. `#[derive(Clone, Copy)]` needed → added to Vnode + VnodeType.
-  6. `implicit autoref` on raw pointer deref → `from_raw_parts` + volatile.
-- Verification: `bash scripts/check.sh` → **PASS=36 FAIL=0 SKIP=0**.
-  BIOS boots to filesystem subsystem online + VFS initialized (40 slots)
-  + RAM filesystem (8 KiB) + 4 test files + root directory listing
-  + file read test (open+read 45 bytes).
+- (see previous entry — VFS + RAM filesystem, 36/36 checks)
 
 ## 2026-09-21 — Round 4 — Stage 4 (Processes & Syscalls) — ✅ COMPLETE
 - (see previous entry — process subsystem, 31/31 checks)

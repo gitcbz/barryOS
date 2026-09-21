@@ -24,6 +24,7 @@ mod mem;
 mod interrupts;
 mod proc;
 mod fs;
+mod dev;
 
 use core::sync::atomic::Ordering;
 
@@ -104,16 +105,22 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
 
     serial::print_str("[stage5] filesystem subsystem online.\n");
 
+    // Stage 6: device drivers (framebuffer + keyboard).
+    serial::print_str("[stage6] initializing device drivers...\n");
+    dev::init(boot_info);
+
+    serial::print_str("[stage6] device drivers online.\n");
+
     // Print final diagnostics.
     proc::process::print_table();
     proc::scheduler::print_stats();
     fs::vfs::print_table();
 
-    serial::print_str("[ok] Stage 5 complete; halting.\n");
+    serial::print_str("[ok] Stage 6 complete; halting.\n");
 
     // VGA summary
     vga::clear();
-    vga::print_str("barryOS booted [Stage 5]\n");
+    vga::print_str("barryOS booted [Stage 6]\n");
     vga::print_str("self-developed x86_64 kernel\n");
     vga::print_str("[boot] path: ");
     vga::print_str(boot_kind);
@@ -122,6 +129,7 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
     vga::print_str("[irq] IDT + PIC + PIT OK\n");
     vga::print_str("[proc] PCB + scheduler + syscall OK\n");
     vga::print_str("[fs] VFS + RAMfs OK\n");
+    vga::print_str("[dev] framebuffer + keyboard OK\n");
 
     halt_forever();
 }

@@ -54,23 +54,11 @@ fn handle_timer() {
     super::TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Keyboard IRQ1 — read scancode, print ASCII if it's a printable key.
+/// Keyboard IRQ1 — read scancode, pass to dev::keyboard for line buffering.
 fn handle_keyboard() {
     let scancode = unsafe { port_in(KB_DATA) };
     super::KEYBOARD_IRQS.fetch_add(1, Ordering::Relaxed);
-
-    // Key release = bit 7 set; ignore for now.
-    if scancode & 0x80 != 0 {
-        return;
-    }
-    if (scancode as usize) < SCANCODE_MAP.len() {
-        let ch = SCANCODE_MAP[scancode as usize];
-        if ch != 0 {
-            serial::print_str("[kb] key: ");
-            serial::write_char(ch);
-            serial::print_str("\n");
-        }
-    }
+    crate::dev::keyboard::handle_scancode(scancode);
 }
 
 /// Configure the PIT to fire at ~100 Hz.
