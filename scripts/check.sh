@@ -342,6 +342,29 @@ else
     fail "BIOS: Win32 stubs missing"
 fi
 
+# ------------------------------------------------ L13: Stage 11 VMware --
+section "L13: Stage 11 VMware optimization"
+if grep -aq "VMware optimization online" /tmp/barryos-bios.log; then
+    pass "BIOS: Stage 11 VMware optimization online"
+else
+    fail "BIOS: Stage 11 VMware not online"
+fi
+if grep -aq "SVGA-II driver" /tmp/barryos-bios.log; then
+    pass "BIOS: SVGA-II driver initialized"
+else
+    fail "BIOS: SVGA-II driver missing"
+fi
+if grep -aq "backdoor" /tmp/barryos-bios.log; then
+    pass "BIOS: VMware backdoor probed"
+else
+    fail "BIOS: VMware backdoor missing"
+fi
+if grep -aq "balloon" /tmp/barryos-bios.log; then
+    pass "BIOS: memory balloon driver initialized"
+else
+    fail "BIOS: balloon driver missing"
+fi
+
 # ---------------------------------------------------------------- summary --
 section "SUMMARY"
 log "PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"

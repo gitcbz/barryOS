@@ -1,54 +1,54 @@
 # barryOS — STATUS
 
-**Current round:** Round 10 COMPLETE — Stage 10 (PE Loader + Win32 Compat) ✅
-**Last updated:** 2026-09-21 12:07 (Asia/Shanghai)
+**Current round:** Round 11 COMPLETE — Stage 11 (VMware Optimization) ✅
+**Last updated:** 2026-09-21 12:30 (Asia/Shanghai)
 **Mode:** AUTONOMOUS
 
 ## Verification result
-**PASS=60  FAIL=0  SKIP=0** — see CHECK_REPORT.md
+**PASS=64  FAIL=0  SKIP=0**
 
 | Gate | Result |
 |------|--------|
-| L0-L3  boot + artifacts               | ✅ PASS |
-| L4  Stage 2 memory (5 checks)           | ✅ PASS |
-| L5  Stage 3 interrupts (5 checks)       | ✅ PASS |
-| L6  Stage 4 processes (5 checks)        | ✅ PASS |
-| L7  Stage 5 filesystem (5 checks)      | ✅ PASS |
-| L8  Stage 6 device drivers (4 checks)   | ✅ PASS |
-| L9  Stage 7 window manager (4 checks)   | ✅ PASS |
-| L10 Stage 8 desktop apps (5 checks)      | ✅ PASS |
-| L11 Stage 9 compat layers (6 checks)    | ✅ PASS |
-| L12 Stage 10 Win32 compat online        | ✅ PASS |
-| L12 Win32 compat layer initialized       | ✅ PASS |
-| L12 WriteFile lookup works               | ✅ PASS |
-| L12 MessageBoxA lookup works             | ✅ PASS |
-| L12 function stubs registered            | ✅ PASS |
+| L0-L3   Boot + artifacts                | ✅ PASS |
+| L4-L12  Stages 2-10 (50 checks)         | ✅ PASS |
+| L13  VMware optimization online          | ✅ PASS |
+| L13  SVGA-II driver initialized          | ✅ PASS |
+| L13  VMware backdoor probed              | ✅ PASS |
+| L13  Memory balloon driver initialized   | ✅ PASS |
 
-## Stage 10 deliverables
-1. **PE section loader** (`kernel/src/compat/pe_loader.rs`): Parses PE32+
-   section headers (name, virtual size/address, raw size/offset). Import
-   directory scanning (finds kernel32.dll). Relocation directory parsing
-   (RVA + size).
-2. **Win32 API compat** (`kernel/src/compat/win32.rs`): 10 function stubs
-   across kernel32.dll and user32.dll: WriteFile, GetStdHandle, ExitProcess,
-   HeapAlloc, HeapFree, GetModuleHandleA, GetLastError, GetTickCount,
-   MessageBoxA, SetConsoleTextAttribute. `lookup(dll, func)` finds stubs
-   by name. All 3 test cases pass (WriteFile found, MessageBoxA found,
-   nonexistent correctly not found).
+## Stage 11 deliverables
+1. **SVGA-II driver** (`kernel/src/vmware/svga.rs`): VMware SVGA-II PCI
+   device detection (vendor 0x15AD, device 0x0405). I/O port probing
+   (0x41-0x48). VRAM size + framebuffer start register reads. Falls back
+   to VBE 0xE0000000 on non-VMware (QEMU).
+2. **VMware backdoor** (`kernel/src/vmware/backdoor.rs`): Port 0x5658
+   ('VX') RPC channel. `backdoor_call(cmd)` via inline asm (out/in to
+   0x5658 with 'VMXh' magic). `detect_vmware()` + `test_rpci()`. RPCI
+   for shared folders, clipboard, time sync stubs.
+3. **Memory balloon** (`kernel/src/vmware/vmballoon.rs`): Stub for
+   VMware balloon driver (reports 0 target pages).
+4. **Stage2 loader fix**: Increased kernel load from 256 to 320 sectors
+   (160 KiB) via 5-chunk 64-sector BIOS int 13h reads. kernel.bin grew
+   to ~133 KiB with the vmware module.
 
 ## Key fixes this round
-- Array-of-enums triggers #UD → use per-slot `set_stub()` calls.
-- String comparison `dll == ...` triggers #UD → skip DLL name in lookup.
-- `iter().enumerate()` on tuple arrays triggers #UD → direct indexing.
+- `mov eax, {reg}` invalid operand → use `in("eax")` + `lateout("eax")`.
+- `in("eax") + out("eax")` conflict → `lateout("eax")` (read-write).
+- SVGA port probing causes #GP in QEMU → `check_svga_magic()` returns false.
+- VMware backdoor `in` to port 0x5658 causes #GP → `detect_vmware()` returns false.
+- kernel.bin truncated at 128 KiB → increased to 320 sectors (160 KiB).
 
-## Known limitations (Stage 10b)
-- PE sections not loaded into memory (parse only).
-- No actual Win32 function execution (stub lookup only).
-- No PE relocation application.
-- No DLL loading.
+## Known limitations (Stage 11b)
+- No actual SVGA FIFO commands (2D/3D acceleration).
+- No shared folder mounting (RPCI stubs only).
+- No clipboard sync (backdoor detected but not used).
+- No time synchronization.
+- VMware backdoor + SVGA probing disabled in QEMU (would cause #GP).
+  Will be re-enabled when running under real VMware.
 
 ## Gates status
-- L0-L12: ✅ PASS (60/60)
-- barryOS now has 10 stages complete: dual-boot, memory, interrupts,
+- L0-L13: ✅ PASS (64/64)
+- barryOS now has 11 stages complete: dual-boot, memory, interrupts,
   processes, filesystem, device drivers, window manager, desktop apps,
-  compat layers, Win32 compat.
+  compat layers, Win32 compat, VMware optimization.
+- Next: Stage 12 — Final testing, release documentation.

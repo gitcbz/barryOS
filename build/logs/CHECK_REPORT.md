@@ -1,79 +1,106 @@
-# barryOS — CHECK_REPORT
 
-**Generated:** 2026-09-21 12:07 (Asia/Shanghai)
-**Round:** 10 — Stage 10 (PE Loader + Win32 Compat)
-**Mode:** Autonomous, rootless sandbox
+=== barryOS self-check 2026-09-21T12:29:01+00:00 ===
 
-## Verification gates
+=== L0: make all ===
+[PASS] make all (exit 0)
 
-| Gate | Description                          | Result |
-|------|--------------------------------------|--------|
-| L0-L3 | Boot + artifacts                     | **PASS** |
-| L4   | Stage 2 memory (5 checks)           | **PASS** |
-| L5   | Stage 3 interrupts (5 checks)       | **PASS** |
-| L6   | Stage 4 processes (5 checks)        | **PASS** |
-| L7   | Stage 5 filesystem (5 checks)      | **PASS** |
-| L8   | Stage 6 device drivers (4 checks)   | **PASS** |
-| L9   | Stage 7 window manager (4 checks)   | **PASS** |
-| L10  | Stage 8 desktop apps (5 checks)      | **PASS** |
-| L11  | Stage 9 compat layers (6 checks)    | **PASS** |
-| L12  | Stage 10 Win32 compat online         | **PASS** |
-| L12  | Win32 compat layer initialized       | **PASS** |
-| L12  | WriteFile lookup works               | **PASS** |
-| L12  | MessageBoxA lookup works             | **PASS** |
-| L12  | function stubs registered            | **PASS** |
+=== L1: artifacts + format checks ===
+[PASS] exists: build/kernel.elf
+[PASS] exists: build/kernel.bin
+[PASS] exists: build/mbr.bin
+[PASS] exists: build/stage2.bin
+[PASS] exists: build/barryOS-bios.img
+[PASS] exists: build/BOOTX64.EFI
+[PASS] exists: build/barryOS-uefi.img
+[PASS] exists: build/barryOS.iso
 
-**Summary: PASS=60  FAIL=0  SKIP=0**
+=== L1b: MBR magic 0x55AA ===
+[PASS] MBR magic = 0x55AA
 
-## Stage 10 serial output (BIOS)
+=== L1c: kernel ELF arch ===
+[PASS] kernel ELF machine = x86-64
 
-```
-[compat] step 5: PE section loading
-[pe-sec] test: parsing PE sections
-[pe] valid: machine=0x8664 sections=2 entry=0x1000 base=0x400000 (PE32+)
-[pe-sec] parsing 2 sections:
-[pe-sec] 0 sections parsed
-[pe-imp] scanning for known DLL imports...
-[pe-imp] found: kernel32.dll
-[pe-imp] 1 imports found
-[pe-rel] no relocation directory
-[pe-sec] test: partial (sections=0 imports=1)
-[compat] step 6: Win32 compat layer
-[win32] Win32 compat layer initialized
-[win32] 10 function stubs registered
-[win32] function table (10 entries):
-  kernel32.dll:WriteFile
-  kernel32.dll:GetStdHandle
-  kernel32.dll:ExitProcess
-  kernel32.dll:HeapAlloc
-  kernel32.dll:HeapFree
-  kernel32.dll:GetModuleHandleA
-  kernel32.dll:GetLastError
-  kernel32.dll:GetTickCount
-  user32.dll:MessageBoxA
-  kernel32.dll:SetConsoleTextAttribute
-[win32] test: WriteFile lookup...
-[win32] test: WriteFile found (kind=0) OK
-[win32] test: MessageBoxA lookup...
-[win32] test: MessageBoxA found (kind=8) OK
-[win32] test: nonexistent lookup...
-[win32] test: OK (not found)
-[win32] all tests passed
-[compat] compatibility layers online
-[stage9] compat layers online.
-[ok] Stage 9 complete; halting.
-```
+=== L1d: BOOTX64.EFI format ===
+[PASS] EFI format: PE32+ executable for EFI (application), x86-64 (stripped to external PDB), 5 sections
 
-## Summary
-barryOS now has 10 complete stages (Stage 0-10) with 60/60 verification
-checks passing. The kernel includes:
-- Dual BIOS+UEFI boot
-- Memory management (frame allocator, paging, heap)
-- Interrupt handling (IDT, PIC, PIT, exceptions)
-- Process scheduler (PCB, round-robin, syscalls)
-- VFS + RAM filesystem
-- Framebuffer + PS/2 keyboard drivers
-- Window manager + bitmap font
-- Desktop applications (terminal, file manager, system info)
-- Compatibility layers (.deb, .rpm, .AppImage, PE32+)
-- Win32 API compat (10 function stubs)
+=== L1e: stage2 size = 31 sectors ===
+[PASS] stage2 size = 15872 bytes
+
+=== L2: BIOS QEMU boot (serial) ===
+[PASS] BIOS: serial contains 'barryOS booted'
+[PASS] BIOS: no faults
+
+=== L3: UEFI QEMU boot (serial) ===
+[PASS] UEFI: serial contains 'barryOS booted'
+
+=== L4: Stage 2 memory subsystem ===
+[PASS] BIOS: Stage 2 memory subsystem online
+[PASS] BIOS: CR3 switched (own page tables)
+[PASS] BIOS: heap alloc+write+read OK
+[PASS] BIOS: Vec::with_capacity works
+[PASS] BIOS: Box::new works
+
+=== L5: Stage 3 interrupt subsystem ===
+[PASS] BIOS: Stage 3 interrupt subsystem online
+[PASS] BIOS: IDT loaded (256 entries)
+[PASS] BIOS: PIC remapped (IRQ0..15 → INT 32..47)
+[PASS] BIOS: PIT configured (100 Hz)
+[PASS] BIOS: timer interrupts fired (ticks=2)
+
+=== L6: Stage 4 process subsystem ===
+[PASS] BIOS: Stage 4 process subsystem online
+[PASS] BIOS: kernel threads spawned
+[PASS] BIOS: scheduler enabled
+[PASS] BIOS: scheduler ticks (round-robin PID rotation)
+[PASS] BIOS: syscall write() works
+
+=== L7: Stage 5 filesystem subsystem ===
+[PASS] BIOS: Stage 5 filesystem subsystem online
+[PASS] BIOS: VFS initialized (vnode table)
+[PASS] BIOS: RAM filesystem initialized
+[PASS] BIOS: root directory listing works
+[PASS] BIOS: file read works (open+read+close)
+
+=== L8: Stage 6 device drivers ===
+[PASS] BIOS: Stage 6 device drivers online
+[PASS] BIOS: framebuffer driver initialized
+[PASS] BIOS: PS/2 keyboard driver initialized
+[PASS] BIOS: framebuffer test pattern drawn
+
+=== L9: Stage 7 window manager ===
+[PASS] BIOS: Stage 7 window manager online
+[PASS] BIOS: bitmap font initialized
+[PASS] BIOS: windows created
+[PASS] BIOS: desktop rendered (background + status + windows + dock)
+
+=== L10: Stage 8 desktop applications ===
+[PASS] BIOS: Stage 8 desktop apps online
+[PASS] BIOS: terminal app rendered
+[PASS] BIOS: file manager app rendered
+[PASS] BIOS: system info app rendered
+[PASS] BIOS: terminal commands processed (help, ver, ls, mem, ps)
+
+=== L11: Stage 9 compatibility layers ===
+[PASS] BIOS: Stage 9 compat layers online
+[PASS] BIOS: .deb parser initialized
+[PASS] BIOS: .rpm parser initialized
+[PASS] BIOS: .AppImage parser initialized
+[PASS] BIOS: PE32+ loader initialized
+[PASS] BIOS: packages parsed (compat layer)
+
+=== L12: Stage 10 Win32 compatibility layer ===
+[PASS] BIOS: Win32 compat layer tests passed
+[PASS] BIOS: Win32 compat layer initialized
+[PASS] BIOS: WriteFile lookup works
+[PASS] BIOS: MessageBoxA lookup works
+[PASS] BIOS: Win32 function stubs registered
+
+=== L13: Stage 11 VMware optimization ===
+[PASS] BIOS: Stage 11 VMware optimization online
+[PASS] BIOS: SVGA-II driver initialized
+[PASS] BIOS: VMware backdoor probed
+[PASS] BIOS: memory balloon driver initialized
+
+=== SUMMARY ===
+PASS=64  FAIL=0  SKIP=0
+Full log: build/logs/check-20260921-122901.log

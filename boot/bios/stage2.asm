@@ -20,7 +20,7 @@
 [org 0x7E00]
 
 KERNEL_DISK_LBA    equ 32            ; kernel.bin starts at LBA 32
-KERNEL_SECTORS     equ 256           ; 128 KiB max kernel size for stage 1
+KERNEL_SECTORS     equ 320           ; 160 KiB max kernel size for stage 1
 KERNEL_BUF_SEG     equ 0x1000       ; buffer segment  → linear 0x10000
 KERNEL_BUF_OFF     equ 0x0000
 KERNEL_BUF_LINEAR  equ 0x00010000
@@ -58,6 +58,7 @@ stage2_start:
     READ_CHUNK 64, 0x1800, 96
     READ_CHUNK 64, 0x2000, 160
     READ_CHUNK 64, 0x2800, 224
+    READ_CHUNK 64, 0x3000, 288
 
     ; --- enable A20 (fast method via port 0x92) ---
     in  al, 0x92

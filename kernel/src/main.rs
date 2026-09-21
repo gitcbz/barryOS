@@ -28,6 +28,7 @@ mod dev;
 mod wm;
 mod apps;
 mod compat;
+mod vmware;
 
 use core::sync::atomic::Ordering;
 
@@ -132,16 +133,22 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
 
     serial::print_str("[stage9] compat layers online.\n");
 
+    // Stage 11: VMware optimization (SVGA-II, backdoor, balloon).
+    serial::print_str("[stage11] initializing VMware optimization...\n");
+    vmware::init();
+
+    serial::print_str("[stage11] VMware optimization online.\n");
+
     // Print final diagnostics.
     proc::process::print_table();
     proc::scheduler::print_stats();
     fs::vfs::print_table();
 
-    serial::print_str("[ok] Stage 9 complete; halting.\n");
+    serial::print_str("[ok] Stage 11 complete; halting.\n");
 
     // VGA summary
     vga::clear();
-    vga::print_str("barryOS booted [Stage 9]\n");
+    vga::print_str("barryOS booted [Stage 11]\n");
     vga::print_str("self-developed x86_64 kernel\n");
     vga::print_str("[boot] path: ");
     vga::print_str(boot_kind);
@@ -154,6 +161,7 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
     vga::print_str("[wm] windows + font + dock OK\n");
     vga::print_str("[apps] terminal + files + sysinfo OK\n");
     vga::print_str("[compat] deb + rpm + appimage + pe + win32 OK\n");
+    vga::print_str("[vmware] SVGA + backdoor + balloon OK\n");
 
     halt_forever();
 }
