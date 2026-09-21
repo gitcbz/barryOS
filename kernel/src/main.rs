@@ -153,7 +153,7 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
     vga::print_str("[dev] framebuffer + keyboard OK\n");
     vga::print_str("[wm] windows + font + dock OK\n");
     vga::print_str("[apps] terminal + files + sysinfo OK\n");
-    vga::print_str("[compat] deb + rpm + appimage + pe OK\n");
+    vga::print_str("[compat] deb + rpm + appimage + pe + win32 OK\n");
 
     halt_forever();
 }

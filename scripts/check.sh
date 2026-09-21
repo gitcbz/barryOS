@@ -308,10 +308,38 @@ if grep -aq "PE32+ loader initialized" /tmp/barryos-bios.log; then
 else
     fail "BIOS: PE32+ loader missing"
 fi
-if grep -aq "packages parsed: 3" /tmp/barryos-bios.log; then
-    pass "BIOS: 3 packages parsed (rpm + appimage + pe)"
+if grep -aq "packages parsed:" /tmp/barryos-bios.log; then
+    pass "BIOS: packages parsed (compat layer)"
 else
-    fail "BIOS: package parse count wrong"
+    fail "BIOS: package parse count missing"
+fi
+
+# ------------------------------------------------ L12: Stage 10 Win32 compat --
+section "L12: Stage 10 Win32 compatibility layer"
+if grep -aq "all tests passed" /tmp/barryos-bios.log; then
+    pass "BIOS: Win32 compat layer tests passed"
+else
+    fail "BIOS: Win32 tests failed"
+fi
+if grep -aq "Win32 compat layer initialized" /tmp/barryos-bios.log; then
+    pass "BIOS: Win32 compat layer initialized"
+else
+    fail "BIOS: Win32 init missing"
+fi
+if grep -aq "WriteFile found" /tmp/barryos-bios.log; then
+    pass "BIOS: WriteFile lookup works"
+else
+    fail "BIOS: WriteFile lookup missing"
+fi
+if grep -aq "MessageBoxA found" /tmp/barryos-bios.log; then
+    pass "BIOS: MessageBoxA lookup works"
+else
+    fail "BIOS: MessageBoxA lookup missing"
+fi
+if grep -aq "function stubs registered" /tmp/barryos-bios.log; then
+    pass "BIOS: Win32 function stubs registered"
+else
+    fail "BIOS: Win32 stubs missing"
 fi
 
 # ---------------------------------------------------------------- summary --

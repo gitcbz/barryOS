@@ -10,6 +10,8 @@ pub mod deb;
 pub mod rpm;
 pub mod appimage;
 pub mod pe;
+pub mod pe_loader;
+pub mod win32;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use crate::serial;
@@ -40,6 +42,13 @@ pub fn init() {
     serial::print_str("[compat] step 4: init PE loader\n");
     pe::init();
     pe::test_parse();
+
+    serial::print_str("[compat] step 5: PE section loading\n");
+    pe_loader::test_sections();
+
+    serial::print_str("[compat] step 6: Win32 compat layer\n");
+    win32::init();
+    win32::test();
 
     INITIALIZED.store(true, Ordering::Release);
     serial::print_str("[compat] compatibility layers online\n");
