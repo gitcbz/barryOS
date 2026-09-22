@@ -6,9 +6,10 @@ name: build
 #   push to main   -> updates a rolling "latest" release
 #   tag v*         -> creates a versioned release
 #
-# The images are the deliverable, so they are published before the boot check
-# runs: a regression that breaks booting should still leave the last good
-# artifacts downloadable while the run goes red.
+# No QEMU here.  The runner builds and publishes; booting is verified on a real
+# hypervisor, where the firmware is the one people actually use.  Structural
+# checks on the artifacts still run, because a mis-shaped file should not reach
+# a release.
 
 on:
   push:
@@ -24,7 +25,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -35,7 +36,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             nasm xorriso mtools dosfstools qemu-utils \
             clang lld binutils-mingw-w64-x86-64 \
-            qemu-system-x86 ovmf file xxd
+            python3 file xxd
           nasm -v
           xorriso --version | head -1
           qemu-img --version | head -1
@@ -49,8 +50,8 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Add the no_std target and rust-src
-        # rust-src is not optional: .cargo/config.toml sets build-std, so core
-        # and compiler_builtins are compiled from source alongside the kernel.
+        # rust-src is not optional: kernel/.cargo/config.toml sets build-std, so
+        # core and compiler_builtins are compiled alongside the kernel.
         run: |
           rustup target add x86_64-unknown-none
           rustup component add rust-src
@@ -60,15 +61,16 @@ jobs:
         run: make all vmdk
 
       - name: Inspect the artifacts
-        # Cheap structural checks.  scripts/check.sh does the real boot test
-        # later; this catches a build that produced a file of the wrong shape
-        # before anything is published.
+        # Cheap structural checks, so a build that produced a file of the wrong
+        # shape fails here rather than being published.
         run: |
           ls -la build/
           echo "--- MBR magic ---"
           test "$(od -An -tx1 -j510 -N2 build/mbr.bin | tr -d ' \n')" = "55aa"
           echo "--- kernel ELF ---"
           readelf -h build/kernel.elf | grep -i 'Machine:.*X86-64'
+          echo "--- flat kernel within the loader's ceiling ---"
+          test "$(stat -c%s build/kernel.bin)" -le 8388608
           echo "--- EFI application ---"
           file build/BOOTX64.EFI
           file build/BOOTX64.EFI | grep -qiE 'PE32\+|EFI'
@@ -118,8 +120,3 @@ jobs:
             build/barryOS-uefi.img \
             build/barryOS-bios.vmdk \
             build/barryOS-uefi.vmdk
-
-      - name: Boot both firmware paths in QEMU
-        # Last, so a regression leaves the release above intact and the run
-        # still goes red.
-        run: bash scripts/check.sh
