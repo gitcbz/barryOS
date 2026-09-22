@@ -15,6 +15,11 @@ static FB_WIDTH: AtomicU32 = AtomicU32::new(0);
 static FB_HEIGHT: AtomicU32 = AtomicU32::new(0);
 static FB_PITCH: AtomicU32 = AtomicU32::new(0);
 static FB_BPP: AtomicU32 = AtomicU32::new(32);
+/// GOP PixelFormat: 0 = PixelRedGreenBlueReserved8BitPerColor (RGBX),
+/// 1 = PixelBlueGreenRedReserved8BitPerColor (BGRX).  Read from BootInfo; the
+/// old code assumed BGRX unconditionally, which swaps red and blue on any
+/// firmware that reports RGBX.
+static FB_FORMAT: AtomicU32 = AtomicU32::new(1);
 
 /// BootInfo mirror (must match `bootinfo.rs` + `efi_main.c`).
 #[repr(C)]
@@ -56,6 +61,7 @@ pub fn init(boot_info: usize) {
             FB_HEIGHT.store(bi.height, Ordering::SeqCst);
             FB_PITCH.store(bi.pixels_per_scanline * 4, Ordering::SeqCst);
             FB_BPP.store(32, Ordering::SeqCst);
+            FB_FORMAT.store(bi.pixel_format, Ordering::SeqCst);
             serial::print_str("[fb] GOP: ");
             serial::print_hex(bi.width as u64);
             serial::print_str("x");
@@ -76,7 +82,7 @@ pub fn init(boot_info: usize) {
 
 /// Plot a single pixel at (x, y) with RGB color.
 pub fn put_pixel(x: u32, y: u32, r: u8, g: u8, b: u8) {
-    let addr = FB_ADDR.load(Ordering::Relaxed);
+    let addr = draw_base();
     let w = FB_WIDTH.load(Ordering::Relaxed);
     let h = FB_HEIGHT.load(Ordering::Relaxed);
     let pitch = FB_PITCH.load(Ordering::Relaxed);
@@ -84,25 +90,56 @@ pub fn put_pixel(x: u32, y: u32, r: u8, g: u8, b: u8) {
         return;
     }
     let off = (y as u64) * (pitch as u64) + (x as u64) * 4;
-    // Pixel format: assume BGRX (32-bit) — common for GOP/QEMU.
-    let pixel: u32 = 0xFF00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+    // Honour the GOP/BIOS pixel order instead of assuming one.  Getting this
+    // backwards swaps red and blue across the whole desktop.
+    let (r0, b0) = if FB_FORMAT.load(Ordering::Relaxed) == 0 {
+        (b as u32, r as u32)          // RGBX: red sits in the low byte
+    } else {
+        (r as u32, b as u32)          // BGRX: blue sits in the low byte
+    };
+    let pixel: u32 = 0xFF00_0000 | (r0 << 16) | ((g as u32) << 8) | b0;
     unsafe {
         core::ptr::write_volatile((addr + off) as *mut u32, pixel);
     }
 }
 
 /// Fill a rectangle with a solid color.
+/// Fill a rectangle.
+///
+/// Hoists the state out of the inner loop: dragging a window recomposites the
+/// whole desktop on every mouse packet, and a per-pixel `put_pixel` (four
+/// atomic loads plus bounds checks each time) made that visibly sluggish.
 pub fn fill_rect(x: u32, y: u32, w: u32, h: u32, r: u8, g: u8, b: u8) {
+    let addr = draw_base();
     let max_x = FB_WIDTH.load(Ordering::Relaxed);
     let max_y = FB_HEIGHT.load(Ordering::Relaxed);
+    let pitch = FB_PITCH.load(Ordering::Relaxed) as u64;
+    if addr == 0 || x >= max_x || y >= max_y || w == 0 || h == 0 {
+        return;
+    }
+
+    let (r0, b0) = if FB_FORMAT.load(Ordering::Relaxed) == 0 {
+        (b as u32, r as u32)
+    } else {
+        (r as u32, b as u32)
+    };
+    let pixel: u32 = 0xFF00_0000 | (r0 << 16) | ((g as u32) << 8) | b0;
+
     let x2 = (x + w).min(max_x);
     let y2 = (y + h).min(max_y);
+    // Byte count for one row, not a pixel count: `off` below advances 4 bytes
+    // per pixel.  Comparing a byte offset against pixel coordinates silently
+    // fills a quarter of the rectangle.
+    let run = ((x2 - x) as u64) * 4;
     let mut yi = y;
     while yi < y2 {
-        let mut xi = x;
-        while xi < x2 {
-            put_pixel(xi, yi, r, g, b);
-            xi += 1;
+        let row = addr + (yi as u64) * pitch + (x as u64) * 4;
+        let mut off = 0u64;
+        while off < run {
+            unsafe {
+                core::ptr::write_volatile((row + off) as *mut u32, pixel);
+            }
+            off += 4;
         }
         yi += 1;
     }
@@ -168,4 +205,134 @@ pub fn info() -> (u64, u32, u32, u32) {
         FB_HEIGHT.load(Ordering::Relaxed),
         FB_BPP.load(Ordering::Relaxed),
     )
+}
+
+/// Screen dimensions in pixels.
+pub fn size() -> (u32, u32) {
+    (FB_WIDTH.load(Ordering::Relaxed), FB_HEIGHT.load(Ordering::Relaxed))
+}
+
+/// Backbuffer: the desktop is composed here and blitted to the display in one
+/// pass.  Drawing straight to the visible framebuffer let the display scan
+/// catch half-finished frames, which is what made dragging a window flicker —
+/// the background fill was visible before the window landed on top of it.
+static FB_BACKBUF: AtomicU64 = AtomicU64::new(0);
+
+/// Where drawing currently goes: the backbuffer when we have one, otherwise
+/// the display itself (degraded, but it still works).
+#[inline]
+fn draw_base() -> u64 {
+    let b = FB_BACKBUF.load(Ordering::Relaxed);
+    if b != 0 {
+        b
+    } else {
+        FB_ADDR.load(Ordering::Relaxed)
+    }
+}
+
+/// Allocate a backbuffer the size of the current mode.
+///
+/// Must run after `mem::init` (it takes frames from the allocator) and after
+/// the mode is known.  If it fails we keep drawing to the display directly.
+pub fn init_backbuffer() {
+    let (addr, w, h, _bpp) = info();
+    let pitch = FB_PITCH.load(Ordering::Relaxed) as u64;
+    if addr == 0 || w == 0 || h == 0 || pitch == 0 {
+        return;
+    }
+    let bytes = pitch * h as u64;
+    let pages = ((bytes + 4095) / 4096) as usize;
+    let p = crate::mem::frame_allocator().alloc_contig(pages);
+    if p == 0 {
+        serial::print_str("[fb] no backbuffer, drawing directly to the display\n");
+        return;
+    }
+    FB_BACKBUF.store(p, Ordering::SeqCst);
+    serial::print_str("[fb] backbuffer: ");
+    serial::print_hex(pages as u64);
+    serial::print_str(" pages at 0x");
+    serial::print_hex(p);
+    serial::print_str("\n");
+}
+
+/// Present the backbuffer.  Cheap enough to do once per frame; the copy is
+/// row-by-row so the display never sees a partial one.
+pub fn flip() {
+    let dst = FB_ADDR.load(Ordering::Relaxed);
+    let src = FB_BACKBUF.load(Ordering::Relaxed);
+    if dst == 0 || src == 0 || dst == src {
+        return;
+    }
+    let w = FB_WIDTH.load(Ordering::Relaxed) as u64;
+    let h = FB_HEIGHT.load(Ordering::Relaxed);
+    let pitch = FB_PITCH.load(Ordering::Relaxed) as u64;
+    let row_bytes = w * 4;
+
+    let mut y = 0u64;
+    while y < h as u64 {
+        let srow = src + y * pitch;
+        let drow = dst + y * pitch;
+        let mut off = 0u64;
+        while off + 8 <= row_bytes {
+            let v = unsafe { core::ptr::read_volatile((srow + off) as *const u64) };
+            unsafe { core::ptr::write_volatile((drow + off) as *mut u64, v) };
+            off += 8;
+        }
+        while off + 4 <= row_bytes {
+            let v = unsafe { core::ptr::read_volatile((srow + off) as *const u32) };
+            unsafe { core::ptr::write_volatile((drow + off) as *mut u32, v) };
+            off += 4;
+        }
+        y += 1;
+    }
+}
+
+/// Read one raw pixel back.
+///
+/// The mouse cursor is drawn straight into the framebuffer, so it has to save
+/// whatever it covers and put it back before moving — there is no compositor
+/// to re-render underneath it.
+pub fn get_pixel_raw(x: u32, y: u32) -> u32 {
+    let addr = draw_base();
+    let w = FB_WIDTH.load(Ordering::Relaxed);
+    let h = FB_HEIGHT.load(Ordering::Relaxed);
+    let pitch = FB_PITCH.load(Ordering::Relaxed);
+    if addr == 0 || x >= w || y >= h {
+        return 0;
+    }
+    let off = (y as u64) * (pitch as u64) + (x as u64) * 4;
+    unsafe { core::ptr::read_volatile((addr + off) as *const u32) }
+}
+
+/// Write back a value previously returned by `get_pixel_raw`.
+pub fn put_pixel_raw(x: u32, y: u32, v: u32) {
+    let addr = draw_base();
+    let w = FB_WIDTH.load(Ordering::Relaxed);
+    let h = FB_HEIGHT.load(Ordering::Relaxed);
+    let pitch = FB_PITCH.load(Ordering::Relaxed);
+    if addr == 0 || x >= w || y >= h {
+        return;
+    }
+    let off = (y as u64) * (pitch as u64) + (x as u64) * 4;
+    unsafe { core::ptr::write_volatile((addr + off) as *mut u32, v) }
+}
+
+/// Move a rectangle up by `dy` pixels, top row first.
+///
+/// Source and destination overlap, so the direction matters: copying downward
+/// would overwrite rows before they are read.
+pub fn copy_rect_up(x: u32, y: u32, w: u32, h: u32, dy: u32) {
+    if dy == 0 || dy >= h {
+        return;
+    }
+    let mut row = 0;
+    while row < h - dy {
+        let mut col = 0;
+        while col < w {
+            let v = get_pixel_raw(x + col, y + row + dy);
+            put_pixel_raw(x + col, y + row, v);
+            col += 1;
+        }
+        row += 1;
+    }
 }
