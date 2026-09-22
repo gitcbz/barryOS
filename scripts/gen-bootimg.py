@@ -29,12 +29,14 @@ def emit_array(f, name, data):
 
 
 def main():
-    if len(sys.argv) != 3:
-        sys.exit("usage: gen-bootimg.py <mbr.bin> <stage2.bin>")
+    if len(sys.argv) not in (3, 4):
+        sys.exit("usage: gen-bootimg.py <mbr.bin> <stage2.bin> [test.exe]")
 
     mbr_path, stage2_path = sys.argv[1], sys.argv[2]
+    exe_path = sys.argv[3] if len(sys.argv) == 4 else None
     mbr = open(mbr_path, "rb").read()
     stage2 = open(stage2_path, "rb").read()
+    exe = open(exe_path, "rb").read() if exe_path else b""
 
     if len(mbr) != 512:
         sys.exit("gen-bootimg: MBR is %d bytes, expected 512" % len(mbr))
@@ -55,9 +57,15 @@ def main():
         f.write("/// LBA 1..: the loader.  Its kernel-size header is still zero and\n")
         f.write("/// must be filled in by whoever writes it.\n")
         emit_array(f, "STAGE2", stage2)
+        if exe:
+            f.write("/// A tiny PE32+ program, installed as /bin/hello.exe so the\n")
+            f.write("/// loader has something to run without needing a disk first.\n")
+            emit_array(f, "TEST_EXE", exe)
 
-    print("[bootimg] embedded MBR (%d B) and stage2 (%d B) into %s"
-          % (len(mbr), len(stage2), OUT))
+    print("[bootimg] embedded MBR (%d B), stage2 (%d B)%s into %s"
+          % (len(mbr), len(stage2),
+             ", test exe (%d B)" % len(exe) if exe else "",
+             OUT))
 
 
 if __name__ == "__main__":

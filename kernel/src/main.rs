@@ -20,6 +20,7 @@ mod vga;
 mod serial;
 mod sha256;
 mod panic;
+mod bootimg;
 mod bootinfo;
 mod mem;
 mod interrupts;

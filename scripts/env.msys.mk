@@ -38,6 +38,9 @@ EFI_CFLAGS :=
 # --- python (for scripts/mk-uefi-img.py) -------------------------------------
 PYTHON   ?= $(MSYS2_ROOT)/mingw64/bin/python3
 
+# mingw-w64 gcc: builds both the EFI application and the test PE.
+MINGW_GCC := $(MSYS2_ROOT)/mingw64/bin/gcc
+
 # --- rustup / cargo ----------------------------------------------------------
 # msys's $HOME is not the Windows user profile, so RUSTUP_HOME arrives unset
 # here and the cargo shim fails with "rustup could not choose a version of

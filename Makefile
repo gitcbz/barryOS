@@ -26,6 +26,9 @@ MMD         ?= mmd
 FILE        ?= file
 READELF     ?= readelf
 QEMU_IMG    ?= qemu-img
+# Cross compiler for the test PE.  Both mingw-w64 gcc (msys2) and
+# x86_64-w64-mingw32-gcc (Linux) produce the same PE.
+MINGW_GCC   ?= gcc
 EFI_CC      ?= clang-19
 EFI_CFLAGS  ?= -target x86_64-unknown-windows
 PYTHON      ?= python3
@@ -43,6 +46,9 @@ STAGE2_BIN  := $(BUILD)/stage2.bin
 # The boot chain, embedded into the kernel so the installer can write it to a
 # target disk whatever medium it booted from.
 BOOTIMG_RS  := $(BUILD)/bootimg.rs
+# A tiny PE32+ program, embedded the same way so the loader has something to
+# run without needing a disk first.
+TEST_EXE    := $(BUILD)/hello.exe
 # stage2 with the kernel size patched in, for the BIOS image only.
 STAGE2_IMG  := $(BUILD)/stage2.patched.bin
 BIOS_IMG    := $(BUILD)/barryOS-bios.img
@@ -129,10 +135,20 @@ $(STAGE2_BIN): $(BOOT_DIR)/bios/stage2.asm
 	@mkdir -p $(BUILD)
 	$(NASM) -f bin $(BOOT_DIR)/bios/stage2.asm -o $(STAGE2_BIN)
 
-# Embed the boot chain into a Rust source file the kernel includes.  rustc
-# records included files in its dep-info, so cargo picks up changes here.
-$(BOOTIMG_RS): $(MBR_BIN) $(STAGE2_BIN) $(ROOT)/scripts/gen-bootimg.py
-	cd $(ROOT) && $(PYTHON) scripts/gen-bootimg.py build/mbr.bin build/stage2.bin
+# Embed the boot chain — and the test program — into a Rust source file the
+# kernel includes.  rustc records included files in its dep-info, so cargo
+# picks up changes here.
+$(TEST_EXE): $(ROOT)/test/hello.c
+	@mkdir -p $(BUILD)
+	# -nostdlib: no CRT, no startup code, no __main.  The entry point is the
+	# function named on the link line, which is exactly what the loader wants
+	# to call.  -lkernel32 gives it a real import table to bind.
+	cd $(ROOT) && $(MINGW_GCC) -nostdlib -Os -Wl,-e,entry -Wl,--subsystem,console \
+	    -o build/hello.exe test/hello.c -lkernel32
+
+$(BOOTIMG_RS): $(MBR_BIN) $(STAGE2_BIN) $(TEST_EXE) $(ROOT)/scripts/gen-bootimg.py
+	cd $(ROOT) && $(PYTHON) scripts/gen-bootimg.py \
+	    build/mbr.bin build/stage2.bin build/hello.exe
 
 $(BIOS_IMG): $(MBR_BIN) $(STAGE2_BIN) $(KERN_BIN)
 	# Tell the loader how big the kernel is.  Written to a *copy*: stage2.bin

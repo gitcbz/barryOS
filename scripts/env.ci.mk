@@ -24,6 +24,10 @@ EFI_CC     := clang
 EFI_CFLAGS := -target x86_64-unknown-windows
 LD         := x86_64-w64-mingw32-ld
 
+# The same mingw-w64 toolchain compiles the test PE (package
+# gcc-mingw-w64-x86-64).
+MINGW_GCC  := x86_64-w64-mingw32-gcc
+
 # QEMU for scripts/check.sh.  The ovmf package puts the 4 MiB images here.
 QEMU          := qemu-system-x86_64
 QEMU_BIOS_DIR := /usr/share/qemu

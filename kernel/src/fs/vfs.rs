@@ -22,8 +22,9 @@ pub enum VnodeType {
 }
 
 pub const MAX_NAME: usize = 31;
-/// Largest single file.  Comfortably larger than the editor's buffer.
-pub const MAX_FILE_SIZE: usize = 16384;
+/// Largest single file.  64 KiB, which is what a small PE image needs — the
+/// previous 16 KiB could not hold one.
+pub const MAX_FILE_SIZE: usize = 65536;
 /// Most children a directory can hold.
 pub const MAX_CHILDREN: usize = 16;
 

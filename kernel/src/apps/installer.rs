@@ -16,17 +16,13 @@
 //! installer that only worked when booted from a hard disk would not be much
 //! of an installer.
 
+use crate::bootimg;
 use crate::dev::{ata, framebuffer};
 use crate::fs::{diskfs, vfs};
 use crate::serial;
 use crate::wm::font;
 use crate::wm::window;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-/// The boot chain, generated into the build directory by `gen-bootimg.py`.
-mod bootimg {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../build/bootimg.rs"));
-}
 
 const WIN_X: u32 = 60;
 const WIN_Y: u32 = 40;

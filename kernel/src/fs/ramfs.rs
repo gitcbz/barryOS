@@ -263,13 +263,22 @@ pub fn create_test_files() {
         create_file_with_content_in(home, "notes", b"hello\n");
     }
 
-    // An executable: the shell interprets it, which is what "running a file"
-    // means until there is a user mode to load real binaries into.
+    // An executable script, and a real PE image.
     let bin = vfs::create_dir(vfs::ROOT_ID, "bin");
     if bin != 0 {
         let id = create_file_with_content_in(bin, "hello",
             b"#!/bin/barryOS\necho hello from an executable script\npwd\nls\n");
         crate::fs::vfs::set_mode(id, crate::fs::perm::MODE_EXEC);
+
+        // A genuine PE32+ program, built from test/hello.c and embedded in the
+        // kernel.  `run /bin/hello.exe` goes through the loader: parse the
+        // headers, map the sections, apply relocations, bind KERNEL32 imports
+        // to the Win32 stubs, and call the entry point.
+        let exe = create_file_in(bin, "hello.exe");
+        if exe != 0 {
+            write_file(exe, &crate::bootimg::TEST_EXE);
+            vfs::set_mode(exe, crate::fs::perm::MODE_EXEC);
+        }
     }
 
     // Read-only, to show `chmod` and a denied write doing something.

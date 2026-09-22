@@ -147,6 +147,15 @@ fn prompt() {
     unsafe { INPUT_COL = COL };
 }
 
+/// Append text produced by something other than the shell.
+///
+/// A program run through the compatibility layer writes here, so its output
+/// lands in the same character buffer as everything else and survives the
+/// compositor repainting the window.
+pub fn write_external(text: &str) {
+    put_str(text, PAL_WHITE);
+}
+
 fn newline() {
     unsafe {
         COL = 0;
@@ -863,6 +872,16 @@ fn cmd_run(cwd: u64, path: &str) {
         return;
     }
 
+    let mut buf = [0u8; vfs::MAX_FILE_SIZE];
+    let n = ramfs::read_file(id, &mut buf);
+
+    // A PE image is not a script.  This has to be decided before anything
+    // treats the bytes as text.
+    if crate::compat::is_pe(&buf[..n]) {
+        run_pe_image(&buf[..n], path);
+        return;
+    }
+
     unsafe {
         if RUN_DEPTH >= MAX_RUN_DEPTH {
             err("run: script nesting too deep");
@@ -871,8 +890,6 @@ fn cmd_run(cwd: u64, path: &str) {
         RUN_DEPTH += 1;
     }
 
-    let mut buf = [0u8; vfs::MAX_FILE_SIZE];
-    let n = ramfs::read_file(id, &mut buf);
     let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
 
     put_str("running ", PAL_GREEN);
@@ -895,6 +912,33 @@ fn cmd_run(cwd: u64, path: &str) {
 
     unsafe { RUN_DEPTH -= 1 };
     ok("script finished");
+}
+
+/// Load and run a PE image, then report what the loader did with it.
+fn run_pe_image(data: &[u8], path: &str) {
+    put_str("executing ", PAL_GREEN);
+    put_str(path, PAL_GREEN);
+    put_line(" (PE image)", PAL_GREEN);
+    newline();
+
+    match crate::compat::run_pe(data) {
+        Ok(r) => {
+            newline();
+            put_str("exit code ", PAL_GREY);
+            print_dec(r.exit_code as u64);
+            put_str("   ", PAL_GREY);
+            print_dec(r.sections as u64);
+            put_str(" sections, ", PAL_GREY);
+            print_dec(r.imports as u64);
+            put_str(" imports, ", PAL_GREY);
+            print_dec(r.relocs as u64);
+            put_line(" relocations", PAL_GREY);
+        }
+        Err(why) => {
+            put_str("cannot run: ", PAL_RED);
+            put_line(why, PAL_RED);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
