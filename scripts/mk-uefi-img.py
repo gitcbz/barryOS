@@ -16,7 +16,12 @@ IMG_SECTORS  = 32768               # 16 MiB image
 PART_LBA     = 2048
 PART_SECTORS = IMG_SECTORS - PART_LBA     # 30720 sectors = 15 MiB
 PART_OFFSET  = PART_LBA * 512
-MKFS_FAT     = "/home/z/.opt/usr/sbin/mkfs.fat"
+
+# Tool locations.  The Makefile passes these through from scripts/env.mk so the
+# same script works in the Linux sandbox and on the Windows/msys2 host.
+MKFS_FAT     = os.environ.get("MKFS_FAT", "/home/z/.opt/usr/sbin/mkfs.fat")
+MMD          = os.environ.get("MMD", "mmd")
+MCOPY        = os.environ.get("MCOPY", "mcopy")
 
 def run(cmd):
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -34,14 +39,16 @@ def main():
     #    6144-sector partition yields 6144 clusters -> solid FAT16 range.
     #    OVMF's FAT driver accepts FAT12/16/32; FAT16 here avoids the
     #    "too few clusters" invalid-FAT32 trap.
-    fat_img = "/tmp/barryos-esp.fat"
+    # Scratch FAT image.  Kept next to the output rather than in /tmp so it
+    # works on Windows too (there is no /tmp there); removed at the end.
+    fat_img = out_img + ".esp.fat"
     with open(fat_img, "wb") as f:
         f.truncate(PART_SECTORS * 512)
     run([MKFS_FAT, "-F", "16", "-n", "BARRYOS", fat_img])
-    run(["mmd",   "-i", fat_img, "::/EFI"])
-    run(["mmd",   "-i", fat_img, "::/EFI/BOOT"])
-    run(["mcopy", "-i", fat_img, efi_app,  "::/EFI/BOOT/BOOTX64.EFI"])
-    run(["mcopy", "-i", fat_img, kern_bin, "::/kernel.bin"])
+    run([MMD,   "-i", fat_img, "::/EFI"])
+    run([MMD,   "-i", fat_img, "::/EFI/BOOT"])
+    run([MCOPY, "-i", fat_img, efi_app,  "::/EFI/BOOT/BOOTX64.EFI"])
+    run([MCOPY, "-i", fat_img, kern_bin, "::/kernel.bin"])
 
     # 2. zeroed disk image
     with open(out_img, "wb") as f:

@@ -12,17 +12,23 @@ BUILD       := $(ROOT)/build
 LOGS        := $(BUILD)/logs
 ISO_ROOT    := $(BUILD)/iso_root
 
-CARGO       := cargo
-NASM        := nasm
-GCC         := gcc
-LD          := ld
-OBJCOPY     := objcopy
-XORRISO     := xorriso
-MFORMAT     := mformat
-MCOPY       := mcopy
-MMD         := mmd
-FILE        := file
-READELF     := readelf
+# `?=` so scripts/env.msys.mk can point these at absolute msys2 paths when
+# building on the Windows host; a plain PATH lookup is used otherwise.
+CARGO       ?= cargo
+NASM        ?= nasm
+GCC         ?= gcc
+LD          ?= ld
+OBJCOPY     ?= objcopy
+XORRISO     ?= xorriso
+MFORMAT     ?= mformat
+MCOPY       ?= mcopy
+MMD         ?= mmd
+FILE        ?= file
+READELF     ?= readelf
+EFI_CC      ?= clang-19
+EFI_CFLAGS  ?= -target x86_64-unknown-windows
+PYTHON      ?= python3
+MKFSFAT     ?= mkfs.fat
 
 TARGET      := x86_64-unknown-none
 PROFILE     := release
@@ -33,6 +39,11 @@ KERN_ELF    := $(BUILD)/kernel.elf
 KERN_BIN    := $(BUILD)/kernel.bin
 MBR_BIN     := $(BUILD)/mbr.bin
 STAGE2_BIN  := $(BUILD)/stage2.bin
+# The boot chain, embedded into the kernel so the installer can write it to a
+# target disk whatever medium it booted from.
+BOOTIMG_RS  := $(BUILD)/bootimg.rs
+# stage2 with the kernel size patched in, for the BIOS image only.
+STAGE2_IMG  := $(BUILD)/stage2.patched.bin
 BIOS_IMG    := $(BUILD)/barryOS-bios.img
 EFI_APP     := $(BUILD)/BOOTX64.EFI
 UEFI_IMG    := $(BUILD)/barryOS-uefi.img
@@ -40,7 +51,12 @@ ISO         := $(BUILD)/barryOS.iso
 
 # sizes
 BIOS_IMG_SECTORS := 8192       # 4 MiB BIOS image
-KERNEL_MAX_SECTORS := 128      # stage2 reads this many (see stage2.asm)
+# How much room the loader has for the kernel image.  stage2 streams it to
+# 0x100000 in batches, and the stack grows down from STACK_TOP, so the ceiling
+# is STACK_TOP - 0x100000.  The guard below checks this *and* that the image is
+# big enough to hold the kernel.
+KERNEL_MAX_BYTES := 8388608    # 8 MiB (16384 sectors)
+KERNEL_IMG_LBA   := 41         # must match KERNEL_DISK_LBA in stage2.asm
 
 .PHONY: all kernel bios uefi iso clean check run-bios run-uefi fmt clippy help
 
@@ -65,13 +81,38 @@ help:
 # ---------------------------------------------------------------------------
 kernel: $(KERN_ELF) $(KERN_BIN)
 
-$(KERN_ELF): $(shell find $(KERN_DIR)/src -name '*.rs') $(KERN_DIR)/Cargo.toml $(KERN_DIR)/linker.ld $(KERN_DIR)/.cargo/config.toml
+$(KERN_ELF): $(shell find $(KERN_DIR)/src -name '*.rs') $(KERN_DIR)/Cargo.toml $(KERN_DIR)/linker.ld $(KERN_DIR)/.cargo/config.toml $(BOOTIMG_RS)
 	@mkdir -p $(BUILD)
-	cd $(KERN_DIR) && RUSTFLAGS="-C link-arg=-T$(KERN_DIR)/linker.ld" $(CARGO) build $(KERN_PROFILE_FLAG) --target $(TARGET)
+	# Do NOT set RUSTFLAGS here.  The environment variable *overrides*
+	# `[target.x86_64-unknown-none] rustflags` in kernel/.cargo/config.toml,
+	# which silently dropped `-C relocation-model=static` and produced a
+	# PIC kernel: a .got full of zeroes plus 92 unapplied .rela.dyn entries.
+	# Neither bootloader applies relocations, so every GOT slot stayed 0 and
+	# `zero_bss()` became a no-op (it read start = end = 0 off the GOT).
+	# The kernel then ran with whatever .bss the previous boot had left in
+	# RAM -- invisible on a cold QEMU boot, fatal on a VMware reset.
+	# The linker script is already passed via the config file, so nothing
+	# is lost by letting the config flags through.
+	cd $(KERN_DIR) && $(CARGO) build $(KERN_PROFILE_FLAG) --target $(TARGET)
 	@cp $(KERN_DIR)/target/$(TARGET)/$(PROFILE)/barryos-kernel $(KERN_ELF)
 
 $(KERN_BIN): $(KERN_ELF)
 	$(OBJCOPY) -O binary $(KERN_ELF) $(KERN_BIN)
+	@sz=$$(stat -c%s $(KERN_BIN)); \
+	img_max=$$(( ($(BIOS_IMG_SECTORS) - $(KERNEL_IMG_LBA)) * 512 )); \
+	if [ $$sz -gt $(KERNEL_MAX_BYTES) ]; then \
+	  echo "[kernel] FATAL: kernel.bin is $$sz bytes, over the $(KERNEL_MAX_BYTES) byte ceiling"; \
+	  echo "[kernel] the loader streams it to 0x100000; the stack starts at STACK_TOP"; \
+	  echo "[kernel] raise STACK_TOP in boot/bios/stage2.asm and kernel/src/main.rs"; \
+	  exit 1; \
+	fi; \
+	if [ $$sz -gt $$img_max ]; then \
+	  echo "[kernel] FATAL: kernel.bin is $$sz bytes, but the BIOS image only"; \
+	  echo "[kernel] has $$img_max bytes after LBA $(KERNEL_IMG_LBA)"; \
+	  echo "[kernel] raise BIOS_IMG_SECTORS in the Makefile"; \
+	  exit 1; \
+	fi; \
+	echo "[kernel] $$sz bytes = $$(( ($$sz + 511) / 512 )) sectors"
 
 # ---------------------------------------------------------------------------
 #  BIOS boot chain
@@ -86,15 +127,24 @@ $(STAGE2_BIN): $(BOOT_DIR)/bios/stage2.asm
 	@mkdir -p $(BUILD)
 	$(NASM) -f bin $(BOOT_DIR)/bios/stage2.asm -o $(STAGE2_BIN)
 
+# Embed the boot chain into a Rust source file the kernel includes.  rustc
+# records included files in its dep-info, so cargo picks up changes here.
+$(BOOTIMG_RS): $(MBR_BIN) $(STAGE2_BIN) $(ROOT)/scripts/gen-bootimg.py
+	cd $(ROOT) && $(PYTHON) scripts/gen-bootimg.py build/mbr.bin build/stage2.bin
+
 $(BIOS_IMG): $(MBR_BIN) $(STAGE2_BIN) $(KERN_BIN)
+	# Tell the loader how big the kernel is.  Written to a *copy*: stage2.bin
+	# itself is embedded in the kernel image, so patching it in place would
+	# change the embedded bytes every build and rebuild the kernel forever.
+	cd $(ROOT) && $(PYTHON) scripts/patch-stage2.py build/stage2.bin build/kernel.bin build/stage2.patched.bin
 	# create 4 MiB zeroed image
 	dd if=/dev/zero of=$(BIOS_IMG) bs=512 count=$(BIOS_IMG_SECTORS) status=none
 	# LBA 0: MBR
 	dd if=$(MBR_BIN) of=$(BIOS_IMG) conv=notrunc bs=512 count=1 status=none
-	# LBA 1..31: stage2 (16 KiB)
-	dd if=$(STAGE2_BIN) of=$(BIOS_IMG) conv=notrunc bs=512 seek=1 status=none
-	# LBA 32..: kernel
-	dd if=$(KERN_BIN) of=$(BIOS_IMG) conv=notrunc bs=512 seek=32 status=none
+	# LBA 1..40: stage2 (20 KiB)
+	dd if=$(STAGE2_IMG) of=$(BIOS_IMG) conv=notrunc bs=512 seek=1 status=none
+	# LBA 41..: kernel  (must match KERNEL_DISK_LBA in stage2.asm)
+	dd if=$(KERN_BIN) of=$(BIOS_IMG) conv=notrunc bs=512 seek=41 status=none
 	@echo "[bios] $(BIOS_IMG) ready"
 
 # ---------------------------------------------------------------------------
@@ -104,19 +154,28 @@ uefi: $(UEFI_IMG)
 
 $(EFI_APP): $(BOOT_DIR)/uefi/efi_main.c $(BOOT_DIR)/uefi/efi_types.h $(BOOT_DIR)/uefi/efi.ld
 	@mkdir -p $(BUILD)
-	# clang with the windows target produces MS-ABI code OVMF accepts;
-	# GNU ld then links to a PE32+ EFI application.
-	clang-19 -target x86_64-unknown-windows -ffreestanding -fno-stack-protector \
+	# clang with the windows target produces MS-ABI code OVMF accepts; GNU ld
+	# then links to a PE32+ EFI application.  On msys2, EFI_CC is the mingw-w64
+	# gcc, whose native ABI already *is* the MS ABI, so EFI_CFLAGS is empty and
+	# the same source compiles unchanged.
+	# Relative paths are deliberate: mingw-w64 gcc rewrites absolute POSIX
+	# paths to Windows form before handing them to `as`, and that conversion
+	# mangles non-ASCII characters.  This project lives under a path that has
+	# them, so build from $(ROOT) with bare relative file names instead.
+	cd $(ROOT) && $(EFI_CC) $(EFI_CFLAGS) -ffreestanding -fno-stack-protector \
 	       -mno-red-zone -fshort-wchar -Wall -Wextra -std=gnu11 \
-	       -c $(BOOT_DIR)/uefi/efi_main.c -o $(BUILD)/efi_main.o
-	$(LD) -m i386pep --subsystem 10 -e efi_main --image-base 0x1000000 \
+	       -c boot/uefi/efi_main.c -o build/efi_main.o
+	cd $(ROOT) && $(LD) -m i386pep --subsystem 10 -e efi_main --image-base 0x1000000 \
 	      --disable-runtime-pseudo-reloc -s \
-	      $(BUILD)/efi_main.o -o $(EFI_APP)
+	      build/efi_main.o -o build/BOOTX64.EFI
 	@echo "[uefi] $(EFI_APP) ready"
 
 $(UEFI_IMG): $(EFI_APP) $(KERN_BIN)
-	# partitioned image: MBR + ESP (type 0xEF) populated by mtools
-	python3 $(ROOT)/scripts/mk-uefi-img.py $(UEFI_IMG) $(EFI_APP) $(KERN_BIN)
+	# partitioned image: MBR + ESP (type 0xEF) populated by mkfs.fat + mtools.
+	# Relative paths for the same non-ASCII reason as the EFI app above --
+	# mtools is a native binary and mishandles the converted path.
+	cd $(ROOT) && MKFS_FAT="$(MKFSFAT)" MMD="$(MMD)" MCOPY="$(MCOPY)" \
+	    $(PYTHON) scripts/mk-uefi-img.py build/barryOS-uefi.img build/BOOTX64.EFI build/kernel.bin
 	@echo "[uefi] $(UEFI_IMG) ready"
 
 # ---------------------------------------------------------------------------

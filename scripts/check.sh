@@ -57,9 +57,9 @@ section "L1d: BOOTX64.EFI format"
 effmt=$(file -b build/BOOTX64.EFI 2>/dev/null)
 if echo "$effmt" | grep -aqiE "PE32\+|EFI"; then pass "EFI format: $effmt"; else fail "EFI format: $effmt"; fi
 
-section "L1e: stage2 size = 31 sectors"
+section "L1e: stage2 size = 40 sectors"
 s2sz=$(stat -c%s build/stage2.bin 2>/dev/null)
-if [ "$s2sz" = "15872" ]; then pass "stage2 size = 15872 bytes"; else fail "stage2 size = '$s2sz'"; fi
+if [ "$s2sz" = "20480" ]; then pass "stage2 size = 20480 bytes"; else fail "stage2 size = '$s2sz'"; fi
 
 # ----------------------------------------------------------- L2: BIOS boot --
 section "L2: BIOS QEMU boot (serial)"
