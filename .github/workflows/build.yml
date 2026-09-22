@@ -35,13 +35,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             nasm xorriso mtools dosfstools qemu-utils \
-            clang lld binutils-mingw-w64-x86-64 \
+            clang lld binutils-mingw-w64-x86-64 gcc-mingw-w64-x86-64 \
             python3 file xxd
           nasm -v
           xorriso --version | head -1
           qemu-img --version | head -1
           clang --version | head -1
           x86_64-w64-mingw32-ld --version | head -1
+          x86_64-w64-mingw32-gcc --version | head -1
 
       - name: Install Rust nightly
         run: |
