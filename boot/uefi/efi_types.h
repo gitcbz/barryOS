@@ -240,10 +240,20 @@ typedef struct {
     UINTN FrameBufferSize;
 } EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE;
 
+/* `This` is typed `void *` because the protocol struct below is anonymous;
+   the ABI is identical either way.  QueryMode allocates *Info from the pool
+   and the caller owns it (FreePool). */
+typedef EFI_STATUS (EFIAPI *EFI_GRAPHICS_OUTPUT_PROTOCOL_QUERY_MODE)(
+    void *This, UINT32 ModeNumber, UINTN *SizeOfInfo,
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION **Info);
+
+typedef EFI_STATUS (EFIAPI *EFI_GRAPHICS_OUTPUT_PROTOCOL_SET_MODE)(
+    void *This, UINT32 ModeNumber);
+
 typedef struct {
-    void *QueryMode;            /* EFI_GRAPHICS_OUTPUT_PROTOCOL_QUERY_MODE */
-    void *SetMode;              /* EFI_GRAPHICS_OUTPUT_PROTOCOL_SET_MODE   */
-    void *Blt;                  /* EFI_GRAPHICS_OUTPUT_PROTOCOL_BLT        */
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_QUERY_MODE QueryMode;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_SET_MODE   SetMode;
+    void *Blt;              /* EFI_GRAPHICS_OUTPUT_PROTOCOL_BLT            */
     EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *Mode;   /* offset 24 */
 } EFI_GRAPHICS_OUTPUT_PROTOCOL;
 

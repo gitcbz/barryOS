@@ -16,7 +16,7 @@
 STAGE2_LOAD_SEG    equ 0x0000
 STAGE2_LOAD_OFF    equ 0x7E00
 STAGE2_LBA_START   equ 1
-STAGE2_SECTORS     equ 31            ; 31 * 512 = 15872 bytes (≈16 KiB)
+STAGE2_SECTORS     equ 40            ; 40 * 512 = 20480 bytes (20 KiB)
 
 start:
     cli

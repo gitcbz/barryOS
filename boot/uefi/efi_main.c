@@ -27,6 +27,58 @@ static void put_hex(unsigned long long v);
 static void put_dec(unsigned long long v);
 
 /* ---------------------------------------------------------------------------
+ *  GOP: pick the largest available mode that fits our cap.
+ *
+ *  The firmware leaves the adapter in whatever mode it booted with -- VMware's
+ *  EFI hands us 400x300, far too small for the window manager's 640x480-era
+ *  layout (windows overlapped and text ran off the edges).  Enumerate the
+ *  modes and select the biggest one under the cap.
+ * ------------------------------------------------------------------------- */
+#define GOP_MAX_WIDTH   1024u
+#define GOP_MAX_HEIGHT   768u
+
+static void gop_pick_best_mode(EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop,
+                               EFI_BOOT_SERVICES *BS)
+{
+    if (Gop == NULL || Gop->Mode == NULL ||
+        Gop->QueryMode == NULL || Gop->SetMode == NULL) {
+        return;
+    }
+
+    UINT32 best = 0;
+    UINTN  best_pixels = 0;
+
+    for (UINT32 i = 0; i < Gop->Mode->MaxMode; i++) {
+        UINTN sz = 0;
+        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info = NULL;
+        if (Gop->QueryMode(Gop, i, &sz, &info) != EFI_SUCCESS || info == NULL) {
+            continue;
+        }
+        UINT32 w = info->HorizontalResolution;
+        UINT32 h = info->VerticalResolution;
+        if (w > 0 && h > 0 && w <= GOP_MAX_WIDTH && h <= GOP_MAX_HEIGHT) {
+            UINTN px = (UINTN)w * (UINTN)h;
+            if (px > best_pixels) { best_pixels = px; best = i; }
+        }
+        BS->FreePool(info);          /* QueryMode hands us pool memory */
+    }
+
+    /* Nothing suitable (or already there): keep whatever the firmware chose. */
+    if (best_pixels == 0) return;
+    if (best != Gop->Mode->Mode && Gop->SetMode(Gop, best) != EFI_SUCCESS) {
+        return;
+    }
+
+    puts_(u"[barryOS] GOP mode ");
+    put_dec(best);
+    puts_(u": ");
+    put_dec(Gop->Mode->Info->HorizontalResolution);
+    puts_(u"x");
+    put_dec(Gop->Mode->Info->VerticalResolution);
+    puts_(u"\r\n");
+}
+
+/* ---------------------------------------------------------------------------
  *  efi_main — entry point, EFI ABI.
  * ------------------------------------------------------------------------- */
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
@@ -107,32 +159,45 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop = NULL;
     st = BS->LocateProtocol(&gopGuid, NULL, (void**)&Gop);
     if (st != EFI_SUCCESS) { puts_(u"[barryOS] WARN: no GOP\r\n"); }
+    /* Do this before step 11 reads Mode->FrameBufferBase: SetMode moves it. */
+    if (Gop) gop_pick_best_mode(Gop, BS);
 
     /* ---- 7. Allocate BootInfo (anywhere) ----------------------------------- */
     EFI_PHYSICAL_ADDRESS bi_addr = 0;
-    BS->AllocatePages(AllocateAnyPages, EfiLoaderData, 1, &bi_addr);
+    st = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, 1, &bi_addr);
+    if (st != EFI_SUCCESS) { puts_(u"[barryOS] FAIL: AllocatePages BootInfo\r\n"); goto hang; }
     BootInfo *BI = (BootInfo*)bi_addr;
     /* zero it */
     for (UINTN i = 0; i < sizeof(BootInfo)/8; i++) ((UINT64*)BI)[i] = 0;
 
     /* ---- 8. Allocate stack (anywhere, 64 KiB) ------------------------------- */
     EFI_PHYSICAL_ADDRESS stk_addr = 0;
-    BS->AllocatePages(AllocateAnyPages, EfiLoaderData, 16, &stk_addr);
+    st = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, 16, &stk_addr);
+    if (st != EFI_SUCCESS) { puts_(u"[barryOS] FAIL: AllocatePages stack\r\n"); goto hang; }
     UINT64 stk_top = stk_addr + 16 * 4096;
 
     /* ---- 9. Allocate memmap buffer (anywhere) ------------------------------- */
     EFI_PHYSICAL_ADDRESS mm_addr = 0;
-    BS->AllocatePages(AllocateAnyPages, EfiLoaderData, MEMMAP_PAGES, &mm_addr);
+    st = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, MEMMAP_PAGES, &mm_addr);
+    if (st != EFI_SUCCESS) { puts_(u"[barryOS] FAIL: AllocatePages memmap\r\n"); goto hang; }
     EFI_MEMORY_DESCRIPTOR *Mmap = (EFI_MEMORY_DESCRIPTOR*)mm_addr;
-    UINTN MmapSize = MEMMAP_PAGES * 4096;
+    UINTN MmapBufSize = MEMMAP_PAGES * 4096;
     UINTN MapKey = 0, DescSize = 0;
     UINT32 DescVer = 0;
+    /* Real size of the descriptor array, as reported by GetMemoryMap.  This is
+       NOT MmapBufSize: the buffer is deliberately over-sized and the tail is
+       left uninitialised, so handing the buffer size to the kernel made it
+       parse thousands of bogus descriptors (memmap.rs divides this by
+       DescSize).  Under OVMF the pool happened to read back as zeroes; under
+       VMware's firmware it did not. */
+    UINTN MapSize = 0;
 
     /* ---- 10. GetMemoryMap + ExitBootServices (loop: map may change) -------- */
     for (;;) {
-        UINTN sz = MmapSize;
+        UINTN sz = MmapBufSize;
         st = BS->GetMemoryMap(&sz, Mmap, &MapKey, &DescSize, &DescVer);
         if (st != EFI_SUCCESS) { puts_(u"[barryOS] FAIL: GetMemoryMap\r\n"); goto hang; }
+        MapSize = sz;               /* sz is updated to the used size */
         st = BS->ExitBootServices(ImageHandle, MapKey);
         if (st == EFI_SUCCESS) break;
         /* map changed between GetMemoryMap & ExitBootServices: retry */
@@ -148,7 +213,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     /* ---- 11. Fill BootInfo -------------------------------------------------- */
     BI->magic = BARRYOS_BOOTINFO_MAGIC;
     BI->memmap = Mmap;
-    BI->memmap_size = MmapSize;
+    BI->memmap_size = MapSize;      /* real used size, not the buffer capacity */
     BI->memmap_desc_size = DescSize;
     BI->memmap_desc_version = DescVer;
     if (Gop) {
