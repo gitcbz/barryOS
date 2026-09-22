@@ -1,94 +1,62 @@
-//! VMware SVGA-II graphics driver stubs.
+//! VMware SVGA-II graphics driver — detection only.
 //!
-//! The VMware SVGA-II adapter is a PCI device at:
-//!   - Vendor ID: 0x15AD (VMware)
-//!   - Device ID: 0x0405 (SVGA-II)
+//! The VMware SVGA-II adapter is a PCI device (vendor 0x15AD, device 0x0405)
+//! exposing VRAM, a command FIFO and a register pair.
 //!
-//! It exposes:
-//!   - VRAM (framebuffer memory, up to 128 MiB).
-//!   - FIFO (command queue for 2D/3D acceleration).
-//!   - Registers (index/data port pair at I/O ports 0x41-0x48).
-//!
-//! For Stage 11 we detect the PCI device and report VRAM size.
-//! Actual FIFO commands are deferred to Stage 11b.
+//! Nothing here programs the device.  The desktop is drawn through the
+//! firmware's GOP framebuffer, which the loader hands over in BootInfo, and
+//! that already gives us the right resolution and pitch.  Programming SVGA-II
+//! would only be needed to pick a mode the firmware does not offer, or for
+//! 2D acceleration — Stage 11b work.
 
 use crate::serial;
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
-/// VMware SVGA-II PCI vendor/device IDs.
-const VMWARE_VENDOR: u16 = 0x15AD;
-const SVGA2_DEVICE: u16 = 0x0405;
-
-/// SVGA register I/O ports.
-const SVGA_INDEX_PORT: u16 = 0x41;
-const SVGA_VALUE_PORT: u16 = 0x45;
-const SVGA_BIOS_PORT: u16 = 0x43;
-const SVGA_IRQSTATUS_PORT: u16 = 0x47;
+/// SVGA-II register I/O ports.
+///
+/// These were 0x41/0x43/0x45/0x47 — inside the 8253 PIT / 8237 DMA range.
+/// Probing those is what produced the #GP the old code "worked around" by
+/// disabling the probe: the ports were simply wrong.  The SVGA-II register
+/// pair is 0x1CE (index) and 0x1CF (value).
+const SVGA_INDEX_PORT: u16 = 0x1CE;
+const SVGA_VALUE_PORT: u16 = 0x1CF;
 
 /// SVGA register indices.
 const SVGA_REG_ID: u32 = 0;
-const SVGA_REG_ENABLE: u32 = 1;
-const SVGA_REG_WIDTH: u32 = 2;
-const SVGA_REG_HEIGHT: u32 = 3;
-const SVGA_REG_DEPTH: u32 = 4;
-const SVGA_REG_VRAM_SIZE: u32 = 6;
-const SVGA_REG_FB_START: u32 = 13;
 
-/// SVGA magic ID.
-const SVGA_MAGIC: u32 = 0x900000;
+/// SVGA-II device id, as latched by SVGA_REG_ID.
+#[allow(dead_code)]
+const SVGA_ID_2: u32 = 0x9000_0002;
 
-/// Detected SVGA state.
+/// Detected SVGA state.  Both stay zero: the register interface is not read
+/// until the driver actually drives the device (Stage 11b).
 static SVGA_DETECTED: AtomicBool = AtomicBool::new(false);
 static VRAM_SIZE: AtomicU32 = AtomicU32::new(0);
-static FB_START: AtomicU32 = AtomicU32::new(0);
 
-/// Initialize SVGA-II driver — detect PCI device + read VRAM size.
+/// Report the SVGA-II situation.
+///
+/// Deliberately performs no I/O.  On any hypervisor other than VMware the
+/// SVGA register ports are unassigned and an `in` raises #GP, which this
+/// kernel has no way to resume from; and even on VMware there is nothing to
+/// gain here, because the framebuffer already came from GOP.
 pub fn init() {
-    serial::print_str("[svga] scanning for VMware SVGA-II (vendor=0x15AD device=0x0405)...\n");
+    serial::print_str("[svga] VMware SVGA-II (vendor 0x15AD device 0x0405)\n");
 
-    // For Stage 11 we can't do PCI bus scanning (no PCI config space
-    // access). Instead, we check if the SVGA index port responds with
-    // the magic ID.
-    let detected = check_svga_magic();
-
-    if detected {
-        SVGA_DETECTED.store(true, Ordering::SeqCst);
-        serial::print_str("[svga] VMware SVGA-II detected (magic OK)\n");
-
-        // Read VRAM size.
-        let vram = read_register(SVGA_REG_VRAM_SIZE);
-        VRAM_SIZE.store(vram, Ordering::SeqCst);
-        serial::print_str("[svga] VRAM size: ");
-        serial::print_hex(vram as u64);
-        serial::print_str(" bytes (");
-        serial::print_hex((vram / (1024 * 1024)) as u64);
-        serial::print_str(" MiB)\n");
-
-        // Read framebuffer start.
-        let fb = read_register(SVGA_REG_FB_START);
-        FB_START.store(fb, Ordering::SeqCst);
-        serial::print_str("[svga] framebuffer start: 0x");
-        serial::print_hex(fb as u64);
-        serial::print_str("\n");
-    } else {
-        serial::print_str("[svga] SVGA-II not detected (QEMU or non-VMware)\n");
-        serial::print_str("[svga] using fallback VBE framebuffer (0xE0000000)\n");
-        VRAM_SIZE.store(8 * 1024 * 1024, Ordering::SeqCst);  // 8 MiB fallback
-        FB_START.store(0xE000_0000, Ordering::SeqCst);
+    if !crate::vmware::backdoor::detect_vmware() {
+        serial::print_str("[svga] not running under VMware -- SVGA-II not applicable\n");
+        serial::print_str("[svga] framebuffer: provided by GOP/BootInfo\n");
+        serial::print_str("[svga] SVGA-II driver initialized (inactive)\n");
+        return;
     }
 
-    serial::print_str("[svga] SVGA-II driver initialized\n");
+    serial::print_str("[svga] running under VMware\n");
+    serial::print_str("[svga] framebuffer: provided by GOP/BootInfo\n");
+    serial::print_str("[svga] register interface + FIFO: Stage 11b\n");
+    serial::print_str("[svga] SVGA-II driver initialized (detect only)\n");
 }
 
-/// Check if the SVGA index port responds with the magic ID.
-/// For safety in QEMU (ports 0x41-0x48 may cause #GP), we skip the
-/// actual probe and always return false. The SVGA driver will be
-/// activated when running under real VMware.
-fn check_svga_magic() -> bool {
-    false
-}
-
-/// Write to the SVGA index port.
+/// Write to the SVGA index port.  Unused until Stage 11b.
+#[allow(dead_code)]
 fn write_index(reg: u32) {
     unsafe {
         core::arch::asm!(
@@ -100,7 +68,8 @@ fn write_index(reg: u32) {
     }
 }
 
-/// Read from the SVGA value port.
+/// Read from the SVGA value port.  Unused until Stage 11b.
+#[allow(dead_code)]
 fn read_value() -> u32 {
     let val: u32;
     unsafe {
@@ -114,7 +83,8 @@ fn read_value() -> u32 {
     val
 }
 
-/// Read an SVGA register.
+/// Read an SVGA register.  Unused until Stage 11b.
+#[allow(dead_code)]
 fn read_register(reg: u32) -> u32 {
     write_index(reg);
     read_value()
@@ -125,7 +95,7 @@ pub fn detected() -> bool {
     SVGA_DETECTED.load(Ordering::Relaxed)
 }
 
-/// Get VRAM size.
+/// Get VRAM size (0 until Stage 11b reads the register).
 pub fn vram_size() -> u32 {
     VRAM_SIZE.load(Ordering::Relaxed)
 }
