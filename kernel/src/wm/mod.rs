@@ -10,6 +10,9 @@ pub mod font;
 pub mod window;
 pub mod widgets;
 pub mod desktop;
+pub mod shell;
+pub mod boot;
+pub mod login;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use crate::serial;
@@ -31,9 +34,9 @@ pub fn init() {
     serial::print_str("[wm] step 3: create desktop windows\n");
     desktop::create_desktop();
 
-    serial::print_str("[wm] step 4: render desktop\n");
-    desktop::render();
-
+    // No render here: the apps create their windows in `apps::init()`, which
+    // runs next, and the compositor has to see them.  `main` calls
+    // `desktop::render()` once, after every window exists.
     INITIALIZED.store(true, Ordering::Release);
     serial::print_str("[wm] window manager online\n");
 }
