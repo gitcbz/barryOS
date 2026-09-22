@@ -26,18 +26,29 @@ pub static KEYBOARD_IRQS: AtomicU64 = AtomicU64::new(0);
 pub static EXCEPTIONS:    AtomicU64 = AtomicU64::new(0);
 
 /// Initialize the interrupt subsystem:
-///   1. IDT with 256 entries (exceptions + IRQs).
-///   2. GDT (for future TSS/IST; TSS load deferred to Stage 3b).
+///   1. GDT + TSS (the selectors the IDT gates below refer to).
+///   2. IDT with 256 entries (exceptions + IRQs).
 ///   3. PIC 8259 remap + mask (timer + keyboard enabled).
 ///   4. Enable interrupts (`sti`).
 pub fn init() {
-    serial::print_str("[irq] step 1: build IDT (256 entries)\n");
+    // The GDT has to be ours *before* the first interrupt can be delivered.
+    // Every IDT gate below names selector 0x08 as its target code segment, and
+    // 0x08 only means "64-bit kernel code" in the GDT built here.  The BIOS
+    // path got away without this because stage2.asm installs an identical
+    // layout; under UEFI the firmware's GDT is still live, 0x08 is whatever
+    // the firmware put there, and the first timer IRQ took a #GP loading CS --
+    // whose handler is delivered through the same broken selector, so #DF and
+    // then a triple fault (VMware reports "virtual CPU entered shutdown").
+    serial::print_str("[irq] step 1: build GDT + TSS\n");
+    gdt::init();
+
+    serial::print_str("[irq] step 2: build IDT (256 entries)\n");
     idt::init();
 
-    serial::print_str("[irq] step 2: remap PIC 8259\n");
+    serial::print_str("[irq] step 3: remap PIC 8259\n");
     pic::init();
 
-    serial::print_str("[irq] step 3: enable interrupts (sti)\n");
+    serial::print_str("[irq] step 4: enable interrupts (sti)\n");
     // Enable interrupts.
     unsafe { core::arch::asm!("sti", options(nostack, nomem, preserves_flags)); }
 

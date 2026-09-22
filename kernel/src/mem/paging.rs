@@ -22,9 +22,12 @@ struct PageTable {
     entries: [u64; ENTRY_COUNT],
 }
 
-/// Our PML4 and PDPT0 — static, accessed only via raw pointers.
-static PML4:  PageTable = PageTable { entries: [0; ENTRY_COUNT] };
-static PDPT0: PageTable = PageTable { entries: [0; ENTRY_COUNT] };
+/// Our PML4 and PDPT0 — `static mut`: `remap()` fills them in at runtime.
+/// They used to be immutable statics written through `addr_of!() as *mut`,
+/// which is UB; the `write_volatile` below happened to keep the stores alive,
+/// but the same pattern silently lost every store in interrupts/gdt.rs.
+static mut PML4:  PageTable = PageTable { entries: [0; ENTRY_COUNT] };
+static mut PDPT0: PageTable = PageTable { entries: [0; ENTRY_COUNT] };
 
 static PML4_PHYS: AtomicU64 = AtomicU64::new(0);
 static MAP_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -36,8 +39,8 @@ static MAP_BYTES: AtomicU64 = AtomicU64::new(0);
 /// physical address (0x100000) which is still mapped.
 pub fn remap(_fa: &mut BitmapFrameAllocator) {
     // Get raw pointers to our static page tables.
-    let pml4  = core::ptr::addr_of!(PML4)  as *mut u64;
-    let pdpt0 = core::ptr::addr_of!(PDPT0) as *mut u64;
+    let pml4  = core::ptr::addr_of_mut!(PML4)  as *mut u64;
+    let pdpt0 = core::ptr::addr_of_mut!(PDPT0) as *mut u64;
 
     unsafe {
         // Zero PML4 and PDPT0 via volatile writes (avoid memset).

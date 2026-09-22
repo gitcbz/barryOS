@@ -72,13 +72,22 @@ pub const KERNEL_DATA: u16 = 0x10;
 pub const TSS_SEL:     u16 = 0x18;
 
 /// Static GDT + TSS (aligned, accessed via raw pointers).
+///
+/// These MUST be `static mut`.  `init()` patches the TSS descriptor in place
+/// through `addr_of_mut!`, and writing through a pointer derived from an
+/// *immutable* static is UB: LLVM placed the old `static GDT` in `.rodata`,
+/// concluded its contents were constant, and deleted all six descriptor
+/// stores as dead.  `lgdt` then loaded a GDT whose TSS entry was still zeroed,
+/// so `ltr 0x18` saw a non-present descriptor and raised #GP -- before
+/// `idt::init()` had installed a handler, hence #DF and a triple fault.
+/// (mem/paging.rs escapes this only because it uses `write_volatile`.)
 #[repr(C, align(16))]
 struct GdtTable {
     entries: [GdtEntry; 3],   // null, code, data
     tss:     GdtEntryTss,     // TSS system descriptor
 }
 
-static GDT: GdtTable = GdtTable {
+static mut GDT: GdtTable = GdtTable {
     entries: [
         GdtEntry::zero(),   // null
         // Code: base=0, limit=0xFFFFF, 64-bit, present, DPL=0, S=1, type=exec/read
@@ -112,7 +121,10 @@ static GDT: GdtTable = GdtTable {
     },
 };
 
-static TSS: TaskStateSegment = TaskStateSegment::new();
+/// Same reasoning as `GDT`: `ist[0]` is written at runtime, so this cannot be
+/// an immutable static or LLVM will drop the store (and, as it did before,
+/// discard the whole object).
+static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
 static GDT_ADDR: AtomicU64 = AtomicU64::new(0);
 
@@ -126,14 +138,14 @@ struct GdtDescriptor {
 pub fn init() {
     unsafe {
         // Set up TSS with IST1 = IST_STACK_TOP (for #DF).
-        let tss_ptr = core::ptr::addr_of!(TSS) as *mut TaskStateSegment;
+        let tss_ptr = core::ptr::addr_of_mut!(TSS);
         (*tss_ptr).ist[0] = IST_STACK_TOP as u64;
 
         // Patch the TSS GDT entry with the TSS address + limit.
         let tss_addr = tss_ptr as u64;
         let tss_limit = (core::mem::size_of::<TaskStateSegment>() - 1) as u16;
 
-        let tss_entry = core::ptr::addr_of!(GDT.tss) as *mut GdtEntryTss;
+        let tss_entry = core::ptr::addr_of_mut!(GDT.tss);
         (*tss_entry).limit_low   = tss_limit;
         (*tss_entry).base_low    = (tss_addr & 0xFFFF) as u16;
         (*tss_entry).base_middle = ((tss_addr >> 16) & 0xFF) as u8;
@@ -143,11 +155,12 @@ pub fn init() {
         (*tss_entry).base_upper  = ((tss_addr >> 32) & 0xFFFFFFFF) as u32;
         (*tss_entry).reserved   = 0;
 
-        let gdt_addr = core::ptr::addr_of!(GDT) as u64;
+        let gdt_addr = core::ptr::addr_of_mut!(GDT) as u64;
         GDT_ADDR.store(gdt_addr, core::sync::atomic::Ordering::Release);
 
         let desc = GdtDescriptor {
-            limit: (core::mem::size_of_val(&GDT) - 1) as u16,
+            // Cannot take `&GDT` (it is `static mut` now); use the type size.
+            limit: (core::mem::size_of::<GdtTable>() - 1) as u16,
             base: gdt_addr,
         };
 
@@ -159,6 +172,25 @@ pub fn init() {
             options(nostack, preserves_flags),
         );
         serial::print_str("[irq] lgdt done\n");
+
+        // Reload CS.  `lgdt` only swaps the table pointer -- the code segment
+        // register still holds the selector the firmware (UEFI) or stage2 set
+        // up, which is now outside the new table's limit.  The CPU does not
+        // re-check CS until the next far transfer, so this bites later: the
+        // first `iretq` out of an interrupt handler tries to restore that
+        // stale selector, faults, and the fault handler faults the same way.
+        // A far return is the only way to write CS in 64-bit mode.
+        core::arch::asm!(
+            "push {sel}",
+            "lea {tmp}, [rip + 2f]",
+            "push {tmp}",
+            "retfq",
+            "2:",
+            sel = in(reg) KERNEL_CODE as u64,
+            tmp = lateout(reg) _,
+            options(preserves_flags),
+        );
+        serial::print_str("[irq] cs reloaded\n");
 
         // Load segment registers (data segments).
         core::arch::asm!(

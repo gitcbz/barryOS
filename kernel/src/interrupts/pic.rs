@@ -103,13 +103,16 @@ pub fn init() {
         serial::print_hex(v2 as u64);
         serial::print_str("\n");
 
-        // Mask: enable IRQ0 (timer) + IRQ1 (keyboard) + IRQ2 (cascade).
+        // Unmask IRQ0 (timer), IRQ1 (keyboard) and IRQ2 (cascade to the slave).
         let mask: u8 = !(1 | 2 | 4);
         port_out(PIC1_DATA, mask);
-        port_out(PIC2_DATA, 0xFB);  // slave: all masked except cascade bit 1
+        // Slave: IRQ12 is the PS/2 mouse, and bit 2 is the cascade line the
+        // master uses to reach the slave at all.  Everything else stays masked.
+        let slave_mask: u8 = 0xFB & !(1 << 4);
+        port_out(PIC2_DATA, slave_mask);
     }
 
-    serial::print_str("[irq] PIC remapped: IRQ0..15 → INT 32..47\n");
+    serial::print_str("[irq] PIC remapped: IRQ0..15 → INT 32..47 (timer, kbd, mouse)\n");
 }
 
 /// Small I/O delay — a jump-to-self is the classic 8259 PIC delay.

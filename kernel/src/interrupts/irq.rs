@@ -37,6 +37,8 @@ pub extern "C" fn irq_handler(regs: &Registers) {
         33 => handle_keyboard(),
         // Cascade (IRQ2) — no action, just EOI slave.
         34 => { /* cascade, no-op */ }
+        // IRQ12 — PS/2 mouse (slave PIC).
+        44 => crate::dev::mouse::handle_irq(),
         // Spurious IRQ 7 / 15 — no EOI.
         39 | 47 => { /* spurious */ }
         _ => {

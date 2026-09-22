@@ -85,9 +85,41 @@ struct BootInfoC {
     memmap_size:         u64,
     memmap_desc_size:    u64,
     memmap_desc_version: u64,
+    /// Appended after the original layout, so nothing above it moved.  The
+    /// UEFI loader leaves it zero.
+    boot_flags:          u32,
+    _pad:                u32,
 }
 
 const BARRYOS_BOOTINFO_MAGIC: u64 = 0x534F_5252_4142; // 'BARROS'
+
+/// The bootloader was asked to install rather than start the desktop.
+pub const BOOT_FLAG_INSTALL: u32 = 1;
+
+/// Flags the bootloader passed in, or 0 if there is no valid BootInfo.
+pub fn boot_flags(boot_info: usize) -> u32 {
+    if boot_info == 0 {
+        return 0;
+    }
+    let bi: &BootInfoC = unsafe { &*(boot_info as *const BootInfoC) };
+    if bi.magic != BARRYOS_BOOTINFO_MAGIC {
+        return 0;
+    }
+    bi.boot_flags
+}
+
+/// True if this BootInfo came from the UEFI loader.
+///
+/// `boot_info != 0` is no longer the test: the BIOS stage2 builds a BootInfo
+/// too, so that it can hand over the VBE framebuffer it set up.  A UEFI boot
+/// always carries a memory map; the BIOS path has none (no E820 yet).
+pub fn is_uefi_boot(boot_info: usize) -> bool {
+    if boot_info == 0 {
+        return false;
+    }
+    let bi: &BootInfoC = unsafe { &*(boot_info as *const BootInfoC) };
+    bi.magic == BARRYOS_BOOTINFO_MAGIC && bi.memmap != 0
+}
 
 /// Parse the memory map from the BootInfo pointer (UEFI) or synthesize (BIOS).
 /// Writes into the provided MemMap (avoids large struct return-by-value).
@@ -108,7 +140,9 @@ pub fn parse_into(boot_info: usize, out: &mut MemMap) {
 fn parse_uefi_into(bi: &BootInfoC, out: &mut MemMap) {
     out.source = "UEFI";
     if bi.memmap == 0 || bi.memmap_size == 0 || bi.memmap_desc_size == 0 {
-        serial::print_str("[mem] WARN: empty UEFI memmap, using BIOS fallback\n");
+        // The BIOS stage2 hands us a BootInfo for the framebuffer but has no
+        // E820 map yet, so this is the normal BIOS path, not an error.
+        serial::print_str("[mem] no E820 map from the bootloader, using synthetic map\n");
         bios_fallback_into(out);
         return;
     }

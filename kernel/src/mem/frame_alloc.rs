@@ -15,6 +15,11 @@ use crate::serial;
 pub const BITMAP_BYTES: usize = 8 * 1024;
 pub const MAX_FRAMES: usize = BITMAP_BYTES * 8;
 
+/// Kernel load address, and the top of the kernel's stack.  Must match
+/// `STACK_TOP` in `main.rs` and `boot/bios/stage2.asm`.
+const KERNEL_BASE: usize = 0x0010_0000;
+const KERNEL_STACK_TOP: usize = 0x0100_0000;
+
 /// Static bitmap storage in .bss.  Accessed only via raw pointers to
 /// avoid Rust 2024 `static mut` reference issues (see DECISIONS D12).
 static mut BITMAP: [u8; BITMAP_BYTES] = [0; BITMAP_BYTES];
@@ -66,8 +71,14 @@ impl BitmapFrameAllocator {
             }
         }
 
-        // Mark the kernel image (1 MiB..1 MiB + 256 pages) as used.
-        for f in (0x100_000 / PAGE_SIZE)..(0x100_000 / PAGE_SIZE + 256) {
+        // Reserve the kernel image *and* its stack.  The image is loaded at
+        // 0x100000 and the stack grows down from STACK_TOP, so the whole span
+        // between them belongs to the kernel and must never be handed out.
+        // This has to track STACK_TOP in main.rs / stage2.asm: too small and
+        // the allocator will hand out pages the stack is about to use.
+        let first = KERNEL_BASE / PAGE_SIZE;
+        let last = KERNEL_STACK_TOP / PAGE_SIZE;
+        for f in first..last {
             if f < MAX_FRAMES {
                 set_bit(f);
             }
