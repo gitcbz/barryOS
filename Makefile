@@ -25,6 +25,7 @@ MCOPY       ?= mcopy
 MMD         ?= mmd
 FILE        ?= file
 READELF     ?= readelf
+QEMU_IMG    ?= qemu-img
 EFI_CC      ?= clang-19
 EFI_CFLAGS  ?= -target x86_64-unknown-windows
 PYTHON      ?= python3
@@ -58,7 +59,7 @@ BIOS_IMG_SECTORS := 8192       # 4 MiB BIOS image
 KERNEL_MAX_BYTES := 8388608    # 8 MiB (16384 sectors)
 KERNEL_IMG_LBA   := 41         # must match KERNEL_DISK_LBA in stage2.asm
 
-.PHONY: all kernel bios uefi iso clean check run-bios run-uefi fmt clippy help
+.PHONY: all kernel bios uefi iso vmdk clean check run-bios run-uefi fmt clippy help
 
 all: kernel bios uefi iso
 
@@ -69,6 +70,7 @@ help:
 	@echo "  bios       assemble MBR + stage2, build BIOS disk image"
 	@echo "  uefi       build EFI app + FAT UEFI image"
 	@echo "  iso        build hybrid El Torito ISO (BIOS+UEFI bootable)"
+	@echo "  vmdk       convert the raw images to VMDKs (needs qemu-img)"
 	@echo "  check      run scripts/check.sh (L0-L3 self-verification)"
 	@echo "  run-bios   boot BIOS image in QEMU (with display)"
 	@echo "  run-uefi   boot UEFI image in QEMU (with display)"
@@ -196,6 +198,21 @@ $(ISO): $(BIOS_IMG) $(UEFI_IMG)
 	    -append_partition 2 0xef $(UEFI_IMG) \
 	    -o $(ISO) $(ISO_ROOT)/ 2>&1 | grep -vi "^libisofs:" || true
 	@echo "[iso] $(ISO) ready"
+
+# ---------------------------------------------------------------------------
+#  VMDKs
+# ---------------------------------------------------------------------------
+# Self-contained virtual disks (monolithicSparse), for attaching to a VM
+# directly.  Kept out of `all` because it needs qemu-img, which is not part of
+# the toolchain anywhere else -- a Windows host without qemu-utils still builds
+# everything else.
+VMDK_BIOS := $(BUILD)/barryOS-bios.vmdk
+VMDK_UEFI := $(BUILD)/barryOS-uefi.vmdk
+
+vmdk: $(BIOS_IMG) $(UEFI_IMG)
+	$(QEMU_IMG) convert -f raw -O vmdk $(BIOS_IMG) $(VMDK_BIOS)
+	$(QEMU_IMG) convert -f raw -O vmdk $(UEFI_IMG) $(VMDK_UEFI)
+	@ls -la $(VMDK_BIOS) $(VMDK_UEFI)
 
 # ---------------------------------------------------------------------------
 #  QEMU runners

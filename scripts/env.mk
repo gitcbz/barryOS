@@ -2,12 +2,25 @@
 # Mirrors scripts/env.sh but in Make syntax.
 
 BARRYOS_PREFIX ?= /home/z/.opt
+MSYS2_ROOT     ?= /e/other/msys64
 
-# The Linux sandbox prefix only exists in the build sandbox.  On the Windows
-# host it is absent, so fall back to scripts/env.msys.mk (msys2 toolchain).
+# Three environments, picked by what is actually present:
+#
+#   $(BARRYOS_PREFIX)  the Linux build sandbox this project grew up in
+#   $(MSYS2_ROOT)      the Windows host, using the msys2 toolchain
+#   neither            a plain Linux host — the CI runner
+#
+# Testing for the msys2 root rather than for Windows is deliberate: `OS` is not
+# set in the msys make environment we run under, so it cannot be used here, and
+# /e/other/msys64 is a path no Linux host will ever have.  Getting this wrong
+# is not subtle — the msys branch points every tool at a Windows path.
 ifeq ($(wildcard $(BARRYOS_PREFIX)/usr/bin),)
 
+ifneq ($(wildcard $(MSYS2_ROOT)/usr/bin),)
 include $(ROOT)/scripts/env.msys.mk
+else
+include $(ROOT)/scripts/env.ci.mk
+endif
 
 else
 
