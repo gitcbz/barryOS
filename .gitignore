@@ -1,0 +1,9 @@
+# Build outputs — regenerate with `make all`.  Nothing here is source, and the
+# ISO alone is 36 MB, which is worth not committing on every round.
+/build/
+kernel/target/
+
+# Editor and OS noise
+*.swp
+*~
+.DS_Store
