@@ -58,11 +58,16 @@ ISO         := $(BUILD)/barryOS.iso
 
 # sizes
 BIOS_IMG_SECTORS := 8192       # 4 MiB BIOS image
-# How much room the loader has for the kernel image.  stage2 streams it to
-# 0x100000 in batches, and the stack grows down from STACK_TOP, so the ceiling
-# is STACK_TOP - 0x100000.  The guard below checks this *and* that the image is
-# big enough to hold the kernel.
-KERNEL_MAX_BYTES := 8388608    # 8 MiB (16384 sectors)
+# How much room the loader has for the kernel image.  The BIOS path stages the
+# whole image in conventional memory -- 0x10000 to 0x9F000, the top being the
+# start of video RAM -- and copies it up to 0x100000 in one protected-mode
+# switch, so that window is the ceiling.  Must match KERNEL_STAGE_MAX in
+# boot/bios/stage2.asm; changing one without the other means a kernel that
+# builds and then refuses to load.
+KERNEL_MAX_BYTES := 585728     # 0x8F000 = 0x9F000 - 0x10000
+                               # the UEFI loader has no such limit (it reads the
+                               # file through EFI), but shares this guard so one
+                               # image size has to satisfy every boot path
 KERNEL_IMG_LBA   := 41         # must match KERNEL_DISK_LBA in stage2.asm
 
 .PHONY: all kernel bios uefi iso vmdk pe-check clean check run-bios run-uefi fmt clippy help
@@ -113,8 +118,9 @@ $(KERN_BIN): $(KERN_ELF)
 	img_max=$$(( ($(BIOS_IMG_SECTORS) - $(KERNEL_IMG_LBA)) * 512 )); \
 	if [ $$sz -gt $(KERNEL_MAX_BYTES) ]; then \
 	  echo "[kernel] FATAL: kernel.bin is $$sz bytes, over the $(KERNEL_MAX_BYTES) byte ceiling"; \
-	  echo "[kernel] the loader streams it to 0x100000; the stack starts at STACK_TOP"; \
-	  echo "[kernel] raise STACK_TOP in boot/bios/stage2.asm and kernel/src/main.rs"; \
+	  echo "[kernel] the BIOS loader stages the whole image below 1 MiB before"; \
+	  echo "[kernel] copying it to 0x100000, so the staging window is the limit"; \
+	  echo "[kernel] raise STAGING_LIMIT in boot/bios/stage2.asm and here together"; \
 	  exit 1; \
 	fi; \
 	if [ $$sz -gt $$img_max ]; then \

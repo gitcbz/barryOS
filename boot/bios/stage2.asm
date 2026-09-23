@@ -5,12 +5,12 @@
 ;  64-bit long mode and jump to the kernel flat binary at 0x00100000.
 ;
 ;  Flow:
-;    [16-bit]  load kernel.bin (LBA 40..) to 0x00010000
+;    [16-bit]  load kernel.bin (LBA 41..) into conventional memory
 ;    [16-bit]  VBE: set a 32-bpp linear framebuffer, fill a BootInfo block
 ;    [16-bit]  enable A20 (fast 0x92, then kbd fallback)
 ;    [16-bit]  load 32-bit GDT, enter 32-bit protected mode
-;    [32-bit]  copy kernel 0x10000 → 0x100000 (rep movsd)
-;    [32-bit]  build identity page tables (first 4 MiB)
+;    [32-bit]  copy the staged kernel to 0x100000 (rep movsb)
+;    [32-bit]  build identity page tables (first 256 MiB)
 ;    [32-bit]  enable PAE, set CR3, set EFER.LME, enable paging → long mode
 ;    [32-bit]  load 64-bit GDT, far-jmp to 64-bit code segment
 ;    [64-bit]  set segments + stack, RDI=&BootInfo, jmp 0x100000
@@ -24,26 +24,65 @@
 KERNEL_DISK_LBA    equ 41            ; kernel.bin starts at LBA 41
 KERNEL_FINAL       equ 0x00100000   ; kernel final physical address
 
-; Streaming loader.  The kernel is read through a 32 KiB staging buffer that
-; lives in conventional memory (the BIOS can only write below 1 MiB), and each
-; batch is then copied to KERNEL_FINAL in 32-bit protected mode.  That is what
-; lets the kernel be far larger than conventional memory -- the previous
-; version had to fit the whole image below 1 MiB, which capped it at ~450 KiB.
-STAGING_SEG        equ 0x1000       ; staging buffer segment → linear 0x10000
+; The kernel is staged in conventional memory -- the BIOS can only write to a
+; 16-bit segment:offset -- and copied to KERNEL_FINAL by the single protected-
+; mode switch at the end of the load.  Everything from 0x10000 up to the EBDA
+; is ours to use, so the ceiling on the kernel image is KERNEL_STAGE_MAX.
+STAGING_SEG        equ 0x1000       ; staging area segment → linear 0x10000
 STAGING_OFF        equ 0x0000
 STAGING_LINEAR     equ 0x00010000
+STAGING_LIMIT      equ 0x0009F000   ; top of the staging area, just under video RAM
+KERNEL_STAGE_MAX   equ STAGING_LIMIT - STAGING_LINEAR
 BATCH_SECTORS      equ 64           ; 32 KiB per BIOS call
 BATCH_BYTES        equ BATCH_SECTORS * 512
 
 ; The kernel image starts here and the stack grows down from here, so the two
 ; together must fit in between.  16 MiB leaves room for an 8 MiB kernel with
-; 8 MiB of stack.
+; 8 MiB of stack -- although the staging area below 1 MiB caps the image well
+; before that; see KERNEL_STAGE_MAX.
 STACK_TOP          equ 0x01000000
 
 ; Page table addresses.  Above the staging buffer, below the video window.
 PML4_ADDR          equ 0x00080000
 PDPT_ADDR          equ 0x00081000
 PD_ADDR            equ 0x00082000
+
+; How much of RAM the hand-off map covers, in 2 MiB pages.  128 of them is
+; 256 MiB, which is exactly what the kernel's frame-allocator bitmap can hand
+; out, so nothing the kernel can allocate is unmapped.
+;
+; This has to cover STACK_TOP.  The kernel installs its own 4 GiB map in
+; mem::init, but it runs on the bootloader's stack until it gets there -- so
+; the stack has to be mapped by *these* tables.  Two pages (4 MiB), which is
+; what this used to be, covers the kernel image and nothing else: raising
+; STACK_TOP to 16 MiB without widening the map meant `mov rsp, STACK_TOP` put
+; the stack on an unmapped page, and the first push triple-faulted before a
+; single line of kernel code ran.
+IDENTITY_2M_PAGES  equ 128
+PAGE_2M_ADDR_MASK  equ 0x83          ; present | writable | page size
+
+; -----------------------------------------------------------------------------
+;  Serial trace: COM1 equates and the one macro usable from any bitness.
+;
+;  NASM expands macros in file order, so both have to sit above the first use
+;  -- which is in the streaming loop, barely a hundred lines down.
+; -----------------------------------------------------------------------------
+SER_PORT        equ 0x3F8
+SER_LSR_THRE    equ 0x20           ; transmitter holding register empty
+
+; One character on COM1.  The ser_* helper functions further down are real-mode
+; only (`lodsb` off DS:SI, and `push ax` is not encodable in 64-bit mode), so
+; this is the one that works at every stage.  Clobbers AX and DX.
+%macro SER_BYTE 1
+    mov dx, SER_PORT + 5
+%%wait:
+    in al, dx
+    test al, SER_LSR_THRE
+    jz %%wait
+    mov dx, SER_PORT
+    mov al, %1
+    out dx, al
+%endmacro
 
 ; BootInfo handed to the kernel in RDI (matches kernel/src/bootinfo.rs).
 BOOTINFO_ADDR      equ 0x00006000
@@ -68,6 +107,12 @@ real_start:
     mov sp, 0x5FFE                     ; just under BOOTINFO_ADDR
     sti
 
+    ; --- serial trace: on a headless run this is the only view into stage2 ---
+    call ser_init
+    movzx eax, byte [boot_drive]
+    mov si, msg_ser_enter
+    call ser_mark
+
     ; --- announce (teletype) ---
     mov si, msg_loading
     call print16
@@ -76,20 +121,40 @@ real_start:
     ; Shown before VBE takes the display: BIOS teletype output does not work
     ; once a graphics mode is set, and the splash needs a real framebuffer.
     call boot_menu
+    movzx eax, byte [boot_flags]
+    mov si, msg_ser_menu
+    call ser_mark
 
     ; --- VBE: set up the framebuffer before anything else touches the screen ---
     call vbe_setup
 
-    ; --- stream the kernel to KERNEL_FINAL -------------------------------
-    ; Each pass reads the next batch into the staging buffer — the only place
-    ; the BIOS can be asked to write, since its buffer address is a 16-bit
-    ; segment:offset — and then copies it to its final home in 32-bit
-    ; protected mode.  EBX carries the byte offset into the image.
-    xor ebx, ebx
-.stream:
+    ; --- stage the kernel below 1 MiB ------------------------------------
+    ; The BIOS can only be asked to write to a 16-bit segment:offset, so the
+    ; image has to land in conventional memory first and be copied up to
+    ; KERNEL_FINAL afterwards.  32 KiB per read, into successive positions in
+    ; the staging area; no copying between batches.
+    ;
+    ; The earlier version of this read one batch, switched to protected mode to
+    ; copy it, came back for the next, and repeated.  That return trip never
+    ; worked on this machine: the mode change back to real mode did not land
+    ; where it was aimed, whatever order the two steps were done in, and the
+    ; first 32 KiB of the kernel was all that ever got loaded -- and not even
+    ; that, since the copy goes to 0x100000 while the boot path needs the whole
+    ; image.  A single switch at the end, with nothing to come back to, is the
+    ; shape the pre-rewrite loader used and the shape that demonstrably boots
+    ; here.
+    ;
+    ; The price is a ceiling of KERNEL_STAGE_MAX instead of the 8 MiB the
+    ; staging design was reaching for.
     mov eax, [kernel_size_bytes]
     test eax, eax
     jz no_size                          ; header not patched: refuse to guess
+    cmp eax, KERNEL_STAGE_MAX
+    ja too_big
+
+    xor ebx, ebx
+.stream:
+    mov eax, [kernel_size_bytes]
     cmp ebx, eax
     jae .done
 
@@ -102,31 +167,38 @@ real_start:
     mov ecx, eax                        ; short final batch
 .counted:
     mov [batch_sectors], cx
+    mov word [dap_kernel + 2], cx
+
+    ; Buffer = STAGING_LINEAR + ebx, written as segment:offset.  Every batch
+    ; starts on a 32 KiB boundary, so the offset is always zero and the whole
+    ; transfer stays inside one 64 KiB window.
+    mov eax, ebx
+    shr eax, 4
+    add eax, STAGING_SEG
+    mov word [dap_kernel + 4], 0
+    mov word [dap_kernel + 6], ax
 
     mov eax, ebx
     shr eax, 9
     add eax, KERNEL_DISK_LBA            ; LBA of this batch
-
-    mov word [dap_kernel + 2], cx
-    mov word [dap_kernel + 4], STAGING_OFF
-    mov word [dap_kernel + 6], STAGING_SEG
     mov dword [dap_kernel + 8], eax
     mov dword [dap_kernel + 12], 0
+
+    SER_BYTE 'r'                        ; about to ask the BIOS for a batch
     mov si, dap_kernel
     mov ah, 0x42
     mov dl, [boot_drive]
     int 0x13
     jc disk_err
+    SER_BYTE 'R'
 
     movzx eax, word [batch_sectors]
     shl eax, 9
-    mov [batch_bytes], eax
-
-    call copy_batch                     ; PM: staging → KERNEL_FINAL + ebx
-
-    add ebx, [batch_bytes]
+    add ebx, eax
     jmp .stream
 .done:
+    mov si, msg_ser_loaded
+    call ser_line
 
     ; --- enable A20 (fast method via port 0x92) ---
     in  al, 0x92
@@ -167,6 +239,14 @@ no_size:
 .hang: hlt
     jmp .hang
 
+; The image does not fit in conventional memory.  Say so rather than loading a
+; prefix of it and jumping into whatever the tail happened to be.
+too_big:
+    mov si, msg_too_big
+    call print16
+.hang: hlt
+    jmp .hang
+
 ; -----------------------------------------------------------------------------
 ;  16-bit helpers
 ; -----------------------------------------------------------------------------
@@ -179,6 +259,149 @@ print16:
     int 0x10
     jmp print16
 .done: ret
+
+; Print AX as four hex digits, high nibble first.  Clobbers ax/bx/cx.
+; `int 10h` is not required to preserve registers, so both AX and CX go on the
+; stack around every call rather than being trusted to survive.
+print_hex16:
+    mov cx, 4
+.digit:
+    rol ax, 4
+    push ax
+    push cx
+    and al, 0x0F
+    cmp al, 10
+    jb .dec
+    add al, 'A' - 10
+    jmp .emit
+.dec:
+    add al, '0'
+.emit:
+    mov ah, 0x0E
+    mov bx, 0x0007
+    int 0x10
+    pop cx
+    pop ax
+    dec cx
+    jnz .digit
+    ret
+
+; -----------------------------------------------------------------------------
+;  Serial trace helpers.
+;
+;  Everything before the kernel is otherwise invisible: the screen only shows
+;  what the last thing to touch it drew, and a triple fault leaves no trace at
+;  all.  `serial0.fileType = "file"` in the VMX captures COM1 to a file on the
+;  host, so a few markers turn "it hangs" into "it stopped after X".
+;
+;  COM1 is initialised to 115200 8N1 with the FIFO off and no interrupts --
+;  the same shape the kernel's serial driver uses, so the kernel can carry on
+;  writing without reconfiguring anything.
+;
+;  SER_PORT/SER_LSR_THRE and the SER_BYTE macro are defined at the top of the
+;  file, not here: NASM expands macros in file order and the first marker is
+;  emitted long before this section is reached.
+; -----------------------------------------------------------------------------
+ser_init:
+    push ax
+    push dx
+    mov dx, SER_PORT + 1            ; IER: no interrupts
+    xor al, al
+    out dx, al
+    mov dx, SER_PORT + 3            ; LCR: divisor latch access
+    mov al, 0x80
+    out dx, al
+    mov dx, SER_PORT + 0            ; DLL = 1 -> 115200 baud
+    mov al, 1
+    out dx, al
+    mov dx, SER_PORT + 1            ; DLM = 0
+    xor al, al
+    out dx, al
+    mov dx, SER_PORT + 3            ; LCR: 8 bits, no parity, one stop
+    mov al, 0x03
+    out dx, al
+    mov dx, SER_PORT + 2            ; FCR: FIFO off, clear both queues
+    mov al, 0x07
+    out dx, al
+    mov dx, SER_PORT + 4            ; MCR: DTR | RTS | OUT2
+    mov al, 0x0B
+    out dx, al
+    pop dx
+    pop ax
+    ret
+
+; AL = byte to send.  Clobbers nothing: called from the middle of the boot
+; path, where DX holds the boot drive and SI a message pointer.
+ser_putc:
+    push ax
+    push dx
+    mov ah, al
+    mov dx, SER_PORT + 5            ; LSR
+.poll:
+    in al, dx
+    test al, SER_LSR_THRE
+    jz .poll
+    mov dx, SER_PORT
+    mov al, ah
+    out dx, al
+    pop dx
+    pop ax
+    ret
+
+; SI = NUL-terminated string, DS = 0.
+ser_puts:
+    push ax
+    push si
+.next:
+    lodsb
+    test al, al
+    jz .done
+    call ser_putc
+    jmp .next
+.done:
+    pop si
+    pop ax
+    ret
+
+; SI = string, AX = value printed after it as four hex digits, then CRLF.
+ser_mark:
+    push ax
+    call ser_puts
+    pop ax
+    call ser_hex16
+    mov si, ser_crlf
+    call ser_puts
+    ret
+
+; SI = string, then CRLF.  For milestones with no number worth printing.
+ser_line:
+    call ser_puts
+    mov si, ser_crlf
+    call ser_puts
+    ret
+
+ser_hex16:
+    mov cx, 4
+.digit:
+    rol ax, 4
+    push ax
+    push cx
+    and al, 0x0F
+    cmp al, 10
+    jb .dec
+    add al, 'A' - 10
+    jmp .emit
+.dec:
+    add al, '0'
+.emit:
+    call ser_putc
+    pop cx
+    pop ax
+    dec cx
+    jnz .digit
+    ret
+
+ser_crlf: db 13, 10, 0
 
 ; -----------------------------------------------------------------------------
 ;  boot_menu — ask whether to install or to start.
@@ -197,8 +420,15 @@ boot_menu:
     mov si, msg_menu
     call print16
 
+    ; The tick counter lives at 0040:006C -- the BIOS data area, *segment* 0x40.
+    ; Reading it as [es:0x6C] with ES=0 lands on physical 0x06C, which is the
+    ; interrupt vector table: INT 1Bh's vector, a value that never changes.  The
+    ; elapsed-tick subtraction was therefore always zero and the timeout below
+    ; never fired.  The menu only ever got past itself because someone pressed
+    ; a key, and an unattended or headless boot sat here forever -- which is
+    ; exactly what it did.
     push es
-    xor ax, ax
+    mov ax, 0x40
     mov es, ax
     mov eax, [es:0x6C]
     mov [menu_ticks], eax
@@ -210,7 +440,7 @@ boot_menu:
     jnz .key
 
     push es
-    xor ax, ax
+    mov ax, 0x40
     mov es, ax
     mov eax, [es:0x6C]
     sub eax, [menu_ticks]
@@ -245,96 +475,160 @@ boot_menu:
     ret
 
 ; -----------------------------------------------------------------------------
-;  VBE: set a 32-bpp linear-framebuffer mode and fill in the BootInfo block.
+;  VBE: pick a 32-bpp linear-framebuffer mode and fill in the BootInfo block.
 ;
 ;  The kernel used to hardcode the QEMU Bochs VBE framebuffer at 0xE0000000.
 ;  That address means nothing on real hardware or under VMware, so the BIOS
 ;  path drew into whatever happened to live there and showed nothing.  Ask the
 ;  BIOS where the framebuffer actually is instead.
 ;
-;  Clobbers ax/bx/cx/dx/si/di; DS and ES are restored around every BIOS call
-;  because `int 10h` is not required to preserve them.
+;  The mode numbers are *not* hardcoded, because they cannot be.  This used to
+;  walk a list of 0x118 / 0x115 / 0x112 -- but those are the standard VBE
+;  entries for 24-bpp packed pixel, so the "BitsPerPixel == 32" test below
+;  rejected every one of them and the machine stayed in text mode.  32-bpp
+;  modes are a vendor extension with vendor-chosen numbers (Bochs and QEMU
+;  put them at 0x140+, VMware elsewhere), so the only portable thing to do is
+;  read the list the BIOS hands back in VBE_INFO_BLOCK and walk that.
+;
+;  Among the acceptable modes, the largest that still fits 1024x768 wins.
+;
+;  DS stays 0 throughout; ES is borrowed to reach the BIOS's mode list and put
+;  back to 0 before every `int 10h`, which needs ES:DI to point at a buffer in
+;  our own memory.
 ; -----------------------------------------------------------------------------
+VBE_MAX_WIDTH   equ 1024
+VBE_MAX_HEIGHT  equ 768
+
 vbe_setup:
-    ; --- 4F00: controller info, to confirm VBE 2.0+ (PhysBasePtr needs it) ---
+    ; --- 4F00: controller info.  Write the "VBE2" signature first: that is how
+    ;     the caller asks for the VBE 2.0+ block, and the mode list is in it.
+    mov dword [vbe_controller], 0x32454256     ; "VBE2"
     mov ax, 0x4F00
     mov di, vbe_controller
     int 0x10
-    push ds
-    push es
-    xor dx, dx
-    mov ds, dx
-    mov es, dx
     cmp ax, 0x004F
-    jne .fail_pop
-    cmp dword [vbe_controller], 0x41534556     ; "VESA" as a little-endian dword
-    jne .fail_pop
+    jne .fail_probe
+    cmp dword [vbe_controller], 0x41534556     ; "VESA"
+    jne .fail_probe
     cmp word [vbe_controller + 4], 0x0200      ; VbeVersion >= 2.0
-    jb .fail_pop
-    pop es
-    pop ds
+    jb .fail_probe
 
-    ; --- walk the candidate list, best resolution first ---
-    mov si, vbe_mode_list
+    ; --- where the mode list lives (a real-mode far pointer into the BIOS) ---
+    mov ax, [vbe_controller + 0x0E]
+    mov [vbe_list_off], ax
+    mov ax, [vbe_controller + 0x10]
+    mov [vbe_list_seg], ax
+
+    mov word [vbe_best_mode], 0xFFFF           ; nothing chosen yet
+    mov dword [vbe_best_area], 0
+    mov word [vbe_seen], 0
+
 .next:
-    mov cx, [si]
+    ; Bounded: a malformed list that never reaches the 0xFFFF terminator would
+    ; otherwise walk off the end of the BIOS segment and spin here forever.
+    inc word [vbe_seen]
+    cmp word [vbe_seen], 512
+    ja .fail
+
+    mov ax, [vbe_list_seg]
+    mov es, ax
+    mov bx, [vbe_list_off]
+    mov cx, [es:bx]
+    add word [vbe_list_off], 2
+
+    xor ax, ax
+    mov es, ax
     cmp cx, 0xFFFF                             ; end of list
-    je .fail
-    add si, 2
+    je .pick
 
     mov ax, 0x4F01                             ; get mode info
     mov di, vbe_modeinfo
     int 0x10
-    push ds
-    push es
-    xor dx, dx
-    mov ds, dx
-    mov es, dx
     cmp ax, 0x004F
-    jne .skip_pop
+    jne .next
+
+    test word [vbe_modeinfo + 0x00], 0x0001    ; ModeAttributes: mode supported
+    jz .next
     test word [vbe_modeinfo + 0x00], 0x0080    ; ModeAttributes: linear FB
-    jz .skip_pop
-    cmp byte [vbe_modeinfo + 0x19], 32         ; BitsPerPixel
-    jne .skip_pop
+    jz .next
     cmp byte [vbe_modeinfo + 0x1B], 6          ; MemoryModel: direct colour
-    jne .skip_pop
+    jne .next
+    cmp byte [vbe_modeinfo + 0x19], 32         ; BitsPerPixel
+    jne .next
     cmp dword [vbe_modeinfo + 0x28], 0         ; PhysBasePtr
-    je .skip_pop
-    pop es
-    pop ds
+    je .next
+
+    movzx eax, word [vbe_modeinfo + 0x12]      ; XResolution
+    cmp ax, VBE_MAX_WIDTH
+    ja .next
+    movzx edx, word [vbe_modeinfo + 0x14]      ; YResolution
+    cmp dx, VBE_MAX_HEIGHT
+    ja .next
+
+    imul eax, edx                              ; area, as the tie-breaker
+    cmp eax, [vbe_best_area]
+    jbe .next
+    mov [vbe_best_area], eax
+    mov [vbe_best_mode], cx
+    jmp .next
+
+.pick:
+    mov cx, [vbe_best_mode]
+    cmp cx, 0xFFFF
+    je .fail
+
+    ; Re-read the winner's ModeInfoBlock: the buffer holds whichever mode was
+    ; scanned last, and fill_bootinfo reads the framebuffer address out of it.
+    mov ax, 0x4F01
+    mov di, vbe_modeinfo
+    xor bx, bx
+    mov es, bx
+    int 0x10
+    cmp ax, 0x004F
+    jne .fail
 
     ; --- 4F02: set it, with the linear-framebuffer bit ---
-    mov bx, cx
+    ; Reloaded from memory, not from CX: the 4F01 above is not required to
+    ; return CX unchanged.
+    mov bx, [vbe_best_mode]
     or bx, 0x4000
     mov ax, 0x4F02
     int 0x10
-    push ds
-    push es
-    xor dx, dx
-    mov ds, dx
-    mov es, dx
     cmp ax, 0x004F
-    jne .skip_pop
-    pop es
-    pop ds
+    jne .fail
 
     call fill_bootinfo
     mov si, msg_vbe_ok
     call print16
+    mov ax, [vbe_best_mode]                    ; which mode the BIOS gave us
+    call print_hex16
+    mov si, msg_crlf
+    call print16
+    mov si, msg_ser_vbe
+    mov ax, [vbe_best_mode]
+    call ser_mark
     ret
 
-.skip_pop:
-    pop es
-    pop ds
-    jmp .next
-
-.fail_pop:
-    pop es
-    pop ds
+.fail_probe:
+    ; No VBE 2.0 at all -- a different problem from "VBE is there but nothing
+    ; in its mode list is usable", and worth saying so.
+    mov si, msg_no_vbe20
+    call print16
+    mov si, msg_ser_novbe
+    xor eax, eax
+    call ser_mark
+    ret
 .fail:
-    ; Leave the BootInfo magic unset — the kernel will notice and warn.
+    ; Leave the BootInfo magic unset -- the kernel will notice and warn.
     mov si, msg_no_vbe
     call print16
+    mov ax, [vbe_seen]                         ; how far the scan got
+    call print_hex16
+    mov si, msg_crlf
+    call print16
+    mov si, msg_ser_novbe
+    mov ax, [vbe_seen]
+    call ser_mark
     ret
 
 ; --- copy the mode we just set into the BootInfo block at BOOTINFO_ADDR ---
@@ -455,61 +749,6 @@ enable_a20_kbd:
     jz .wait_data
     ret
 
-; -----------------------------------------------------------------------------
-;  copy_batch — protected mode staging → final address
-;
-;  Entered in real mode with EBX = byte offset into the kernel image.  Copies
-;  `batch_bytes` from the staging buffer to KERNEL_FINAL + EBX, then drops back
-;  to real mode for the next BIOS read.
-;
-;  The stack pointer has to be preserved explicitly: returning to real mode
-;  means reloading SS, and SS:SP must be set together or an interrupt in
-;  between uses a segment with the wrong base.
-; -----------------------------------------------------------------------------
-copy_batch:
-    mov [saved_ebx], ebx
-    mov [saved_sp], sp
-    cli
-    lgdt [gdt32_desc]
-
-    mov eax, cr0
-    or  eax, 1                          ; CR0.PE
-    mov cr0, eax
-    jmp 0x08:cpm_entry                  ; 32-bit CS
-
-[bits 32]
-cpm_entry:
-    mov ax, 0x10
-    mov ds, ax
-    mov es, ax
-    mov ss, ax
-    mov fs, ax
-    mov gs, ax
-
-    mov esi, STAGING_LINEAR
-    mov edi, KERNEL_FINAL
-    add edi, ebx
-    mov ecx, [batch_bytes]
-    shr ecx, 2                          ; dwords
-    rep movsd
-
-    ; --- back to real mode, keeping DS/ES base 0 ---
-    mov eax, cr0
-    and eax, 0xFFFFFFFE
-    mov cr0, eax
-    jmp 0:crm_entry
-
-[bits 16]
-crm_entry:
-    cli
-    xor ax, ax
-    mov ss, ax
-    mov sp, [saved_sp]
-    mov ds, ax
-    mov es, ax
-    sti
-    mov ebx, [saved_ebx]
-    ret
 
 ; -----------------------------------------------------------------------------
 ;  Data
@@ -529,16 +768,14 @@ boot_flags: db 0
 ; BIOS tick count when the boot menu appeared, for its timeout.
 menu_ticks: dd 0
 
-; Streaming-loader state.  Kept in memory rather than on the stack because the
-; stack pointer is reloaded when we drop out of protected mode.
+; How many sectors the batch currently being read holds.  Kept in memory
+; rather than on the stack because the interrupt handlers are the BIOS's.
 batch_sectors: dw 0
-batch_bytes:   dd 0
-saved_ebx:     dd 0
-saved_sp:      dw 0
 
 msg_loading:    db 13, 10, "[barryOS] stage2: loading kernel...", 13, 10, 0
 msg_disk_err:   db "[barryOS] disk read error", 0
 msg_no_size:    db "[barryOS] stage2 header not patched (no kernel size)", 0
+msg_too_big:    db "[barryOS] kernel is larger than the staging area below 1 MiB", 0
 msg_menu:       db 13, 10
                 db "  barryOS", 13, 10
                 db "  --------", 13, 10
@@ -548,18 +785,31 @@ msg_menu:       db 13, 10
 msg_chosen_install: db "1 - install", 13, 10, 13, 10, 0
 msg_chosen_start:   db "2 - start", 13, 10, 13, 10, 0
 msg_timeout:        db "no key pressed, starting", 13, 10, 13, 10, 0
-msg_vbe_ok:     db "[barryOS] VBE mode set", 13, 10, 0
-msg_no_vbe:     db "[barryOS] no usable VBE mode", 13, 10, 0
+msg_vbe_ok:     db "[barryOS] VBE mode 0x", 0
+msg_crlf:       db 13, 10, 0
+msg_no_vbe20:   db "[barryOS] no VBE 2.0 BIOS extension", 13, 10, 0
+msg_no_vbe:     db "[barryOS] no usable VBE mode, scanned 0x", 0
 
-; VBE scratch buffers.  vbe_controller is the 512-byte VBE_INFO_BLOCK, and
-; vbe_modeinfo the 256-byte MODE_INFO_BLOCK; both are written directly by the
-; BIOS, so they must be in flat real-mode addressable memory (DS=0, ES=0).
+; Serial trace, so a headless boot leaves a record.
+msg_ser_enter:  db "[barryOS] stage2 entered, boot drive 0x", 0
+msg_ser_menu:   db "[barryOS] menu answer 0x", 0
+msg_ser_loaded: db "[barryOS] kernel streamed to 0x100000", 0
+msg_ser_vbe:    db "[barryOS] VBE mode 0x", 0
+msg_ser_novbe:  db "[barryOS] VBE failed, modes scanned 0x", 0
+
+; VBE scratch.  vbe_controller is the 512-byte VBE_INFO_BLOCK and vbe_modeinfo
+; the 256-byte MODE_INFO_BLOCK; both are written directly by the BIOS, so they
+; must be in flat real-mode addressable memory (DS=0, ES=0).
+;
+; vbe_list_off/vbe_list_seg carry the far pointer to the BIOS's mode list --
+; it lives in the BIOS's segment, which is why the walk has to borrow ES.
+; vbe_best_* remember the winner while the scan is still running.
 align 4
-vbe_mode_list:
-    dw 0x0118                      ; 1024x768x32
-    dw 0x0115                      ;  800x600x32
-    dw 0x0112                      ;  640x480x32
-    dw 0xFFFF                      ; end
+vbe_list_off:   dw 0
+vbe_list_seg:   dw 0
+vbe_best_mode:  dw 0xFFFF
+vbe_best_area:  dd 0
+vbe_seen:       dw 0
 
 align 4
 vbe_controller: times 512 db 0
@@ -578,6 +828,9 @@ gdt32_code:                           ; 0x08 - 32-bit code, flat, 4 GiB
 gdt32_data:                           ; 0x10 - 32-bit data, flat, 4 GiB
     dw 0xFFFF, 0x0000
     db 0x00, 0x92, 0xCF, 0x00
+gdt32_code16:                         ; 0x18 - 16-bit code, flat, 4 GiB
+    dw 0xFFFF, 0x0000                 ; the D bit (0xCF -> 0x00) is the whole point
+    db 0x00, 0x9A, 0x00, 0x00
 gdt32_end:
 gdt32_desc:
     dw gdt32_end - gdt32_start - 1
@@ -613,8 +866,16 @@ pm_entry:
     mov ss, ax
     mov esp, 0x90000                   ; temp stack
 
-    ; The kernel is already in place: the streaming loop copied each batch
-    ; straight to KERNEL_FINAL as it read it.
+    SER_BYTE 'P'                       ; reached 32-bit protected mode
+
+    ; The kernel is staged below 1 MiB; this is the one trip it takes to its
+    ; final home, and there is no way back to real mode afterwards.
+    mov esi, STAGING_LINEAR
+    mov edi, KERNEL_FINAL
+    mov ecx, [kernel_size_bytes]
+    rep movsb
+
+    SER_BYTE 'K'                       ; kernel image is at KERNEL_FINAL
 
     ; --- zero page tables (3 pages) ---
     mov edi, PML4_ADDR
@@ -626,9 +887,22 @@ pm_entry:
     mov dword [PML4_ADDR], PDPT_ADDR | 0x03
     ; --- PDPT[0] -> PD ---
     mov dword [PDPT_ADDR], PD_ADDR | 0x03
-    ; --- PD[0] = 2 MiB page @ 0x000000, PD[1] = 2 MiB page @ 0x200000 ---
-    mov dword [PD_ADDR + 0],  0x000000 | 0x83
-    mov dword [PD_ADDR + 8],  0x200000 | 0x83
+
+    ; --- PD[0..IDENTITY_2M_PAGES) = identity-mapped 2 MiB pages ---
+    ; One PD covers 1 GiB, so this is the whole address space the kernel can
+    ; touch before it builds its own tables: the kernel image at 1 MiB, the
+    ; stack just below STACK_TOP, and any frame the allocator hands out.
+    mov edi, PD_ADDR
+    xor eax, eax                        ; physical address, stepping by 2 MiB
+    mov ecx, IDENTITY_2M_PAGES
+.fill:
+    mov edx, eax
+    or  edx, PAGE_2M_ADDR_MASK
+    mov [edi], edx
+    add edi, 8
+    add eax, 0x200000
+    dec ecx
+    jnz .fill
 
     ; --- enable PAE ---
     mov eax, cr4
@@ -671,6 +945,8 @@ lm_entry:
     ; BootInfo built by vbe_setup().  If VBE failed the magic is unset and the
     ; kernel falls back on its own, so this is safe to pass unconditionally.
     mov edi, BOOTINFO_ADDR
+
+    SER_BYTE 'L'                       ; reached long mode, about to jump
 
     jmp KERNEL_FINAL                   ; enter kernel _start
 
