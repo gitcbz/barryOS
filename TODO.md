@@ -18,14 +18,52 @@ Kept here so the delta is visible; older rounds are in CHANGELOG.md.
   and hands the kernel a real BootInfo.
 - [x] **GOP mode selection** — the UEFI loader used whatever mode firmware picked
   (VMware: 400x300). It now enumerates and selects the largest mode ≤ 1024x768.
-- [x] **Streaming kernel loader** — stage2 reads a 32 KiB batch into conventional
-  memory, copies it to `0x100000` from protected mode, repeats. Removes the old
-  "must fit below 1 MiB" ceiling (was 832 sectors); size now comes from a
-  build-time patch, and the ceiling is `STACK_TOP - 0x100000` = 8 MiB.
+- [x] **Boot menu tick counter read from the wrong address** — the 18.2 Hz tick
+  count is at `0040:006C`; the code read it as `[es:0x6C]` with `ES = 0`, which
+  is physical `0x06C` — INT 1Bh's vector in the IVT, a value that never
+  changes. The elapsed-tick subtraction was therefore always zero and the
+  five-second timeout never fired, so the menu only ever got past itself when
+  someone pressed a key, and an unattended boot sat there forever. Nothing in
+  the loader after the menu had ever run on a boot without a keypress.
+- [x] **VBE mode list held 24-bpp mode numbers** — it walked `0x118`/`0x115`/
+  `0x112` and then rejected anything whose `BitsPerPixel` was not 32. Those are
+  the standard VBE entries for *24*-bpp packed pixel, so every candidate was
+  rejected and the machine stayed in text mode. 32-bpp modes are a vendor
+  extension with vendor-chosen numbers, so the fix is to walk the list
+  `VBE_INFO_BLOCK.VideoModePtr` hands back rather than guess numbers; among the
+  modes that qualify the largest that fits 1024x768 wins. On VMware that is
+  `0x141`.
+- [x] **The hand-off identity map did not cover the stack** — `lm_entry` sets
+  `rsp = STACK_TOP` (16 MiB) and jumps to the kernel, but the page tables
+  mapped only the two 2 MiB pages `PD[0]` and `PD[1]` (4 MiB). Raising
+  `STACK_TOP` from 2 MiB to 16 MiB to make room for a large kernel widened
+  nothing, so the first push after the jump landed on an unmapped page and
+  triple-faulted before a line of kernel code ran. The map now covers 256 MiB,
+  which is exactly what the frame allocator's bitmap can hand out.
+- [x] **Kernel staged below 1 MiB, one switch to protected mode** — the loader
+  read a 32 KiB batch, switched to protected mode to copy it, and came back for
+  the next. The return trip never worked on VMware: the bytes of the far jump
+  and its target address were both right and it still did not land, whatever
+  order the mode change was done in (16-bit code segment first, per the Intel
+  manuals, included). The loader now stages the whole image in conventional
+  memory and copies it up in the single switch at the end, which is the shape
+  the pre-rewrite loader used and the shape that boots here. The cost is that
+  the ceiling is the staging window (0x10000..0x9F000 = 572 KiB), not 8 MiB —
+  see P2 below.
 - [x] **Build-time size guard** — refuses to build a kernel that does not fit, with
   a message saying which constant to raise. It has already caught one overflow
   that would previously have been a silent truncation and an unbootable image.
-- [x] **El Torito BIOS entry** — still broken; see "Known broken" below.
+- [x] **Serial trace through the whole boot chain** — stage2 initialises COM1
+  and marks each milestone, so `serial0.fileType = "file"` in the VMX turns
+  "it hangs" into "it stopped after X". Every bug above was found with it; none
+  of them would have been findable from the screen alone.
+- [ ] **El Torito BIOS entry** — still broken; see "Known broken" below.
+- [ ] **Recover the 8 MiB kernel ceiling** — the per-batch protected-mode copy
+  that would allow it needs a working protected-to-real return, which this
+  machine refuses. The alternatives are a small ATA PIO reader in stage2 (no
+  BIOS, no mode switching after the initial one, but it loses CD/USB booting)
+  or `INT 15h/AH=87h`, which hangs on this BIOS. 572 KiB is the honest number
+  until one of those is done.
 
 ### Kernel core fixes
 - [x] **`zero_bss` was a no-op** — `Makefile` set `RUSTFLAGS`, which overrides
