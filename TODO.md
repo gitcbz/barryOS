@@ -163,7 +163,11 @@ Kept here so the delta is visible; older rounds are in CHANGELOG.md.
   bytes are `MZ`.  Deliberately *not* a process: the image goes into freshly
   allocated kernel frames, runs at CPL0 on the kernel stack, and returns
   through `barryos_pe_resume`.  No per-process address space exists yet, so
-  a faulting EXE takes the kernel with it.
+  a faulting EXE takes the kernel with it.  The test PE carries a real DIR64
+  fixup on purpose (`test/hello.c` explains why), so the rebasing step is
+  exercised rather than assumed; `tests/pe-contract.py` asserts the pairing
+  between the image and the Win32 table, and `make all` fails if an import
+  stops resolving or the image stops being rebasable.
 - [x] **Win32 emulation** — 16 real `win64` functions behind a name → address
   table (`GetStdHandle`, `WriteFile`, `WriteConsoleA`, `ReadFile`,
   `SetConsoleTextAttribute`, `Get`/`SetLastError`, `GetTickCount(64)`,
