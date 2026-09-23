@@ -148,16 +148,39 @@ Kept here so the delta is visible; older rounds are in CHANGELOG.md.
 - [ ] **`su` has no logout / no session lock**, and there is no way to change a
   password.
 
-### P3 — compatibility layers (currently header parsers only)
+### P3 — compatibility layers
 
 - [ ] **`.deb` / `.rpm` installer** — headers are parsed; `control.tar.gz` /
-  `data.tar.gz` are never decompressed and nothing is installed.
+  `data.tar.gz` are never decompressed and nothing is installed.  A real
+  installer needs DEFLATE plus a tarball reader before it needs anything else.
 - [ ] **AppImage** — detected, never mounted.
-- [ ] **PE loading and execution** — sections, imports and relocations are
-  parsed; there is no image mapping, no address space and no entry jump
-  (deferred to "Stage 10b"). Needs virtual memory per process first.
-- [ ] **Win32 emulation** — ten function *names* in a table with no call
-  dispatch, no import binding and no execution path.
+- [x] **PE loading and execution** — `compat/pe_loader.rs` maps the image
+  (headers + every section at its virtual address, respecting
+  `size_of_image`), applies base relocations (`IMAGE_REL_BASED_DIR64` and
+  `HIGHLOW`; `ABSOLUTE` skipped), binds imports by name through
+  `win32::resolve`, and calls the entry point with MS-ABI `extern "win64"`.
+  Entered from `run <file>` (`terminal::run_pe_image`) when the first two
+  bytes are `MZ`.  Deliberately *not* a process: the image goes into freshly
+  allocated kernel frames, runs at CPL0 on the kernel stack, and returns
+  through `barryos_pe_resume`.  No per-process address space exists yet, so
+  a faulting EXE takes the kernel with it.
+- [x] **Win32 emulation** — 16 real `win64` functions behind a name → address
+  table (`GetStdHandle`, `WriteFile`, `WriteConsoleA`, `ReadFile`,
+  `SetConsoleTextAttribute`, `Get`/`SetLastError`, `GetTickCount(64)`,
+  `GetModuleHandleA`, `GetCommandLineA`, `GetProcessHeap`, `HeapAlloc`,
+  `HeapFree`, `Sleep`, `lstrlenA`), plus `ExitProcess` in `global_asm!` so it
+  can unwind to the caller's stack instead of returning.  Names come from the
+  import directory's hint/name table (plain spelling, matched case
+  insensitively — the `__imp_` form is a linker symbol convention and never
+  appears there).  An import the table does not know fails the load with the
+  name printed, rather than binding a null that faults later.
+- [ ] **32-bit (PE32/i386) execution** — reported as an error rather than
+  loaded.  Needs a compatibility-mode code segment, which needs Ring 3 and a
+  per-process address space first.
+- [ ] **Win32 beyond console I/O** — no GUI (`user32`), no files
+  (`CreateFileA` on a path), no threads, no TLS, no SEH, no import-by-ordinal.
+  A program needing any of these refuses to load, listing the first missing
+  name — which is the honest outcome, not a silent wrong answer.
 
 ### P4 — VMware
 
