@@ -65,9 +65,12 @@ BIOS_IMG_SECTORS := 8192       # 4 MiB BIOS image
 KERNEL_MAX_BYTES := 8388608    # 8 MiB (16384 sectors)
 KERNEL_IMG_LBA   := 41         # must match KERNEL_DISK_LBA in stage2.asm
 
-.PHONY: all kernel bios uefi iso vmdk clean check run-bios run-uefi fmt clippy help
+.PHONY: all kernel bios uefi iso vmdk pe-check clean check run-bios run-uefi fmt clippy help
 
-all: kernel bios uefi iso
+# pe-check is part of `all`: the test PE and the loader's Win32 table are two
+# files that have to agree, and nothing else in the build would notice if they
+# stopped.  See tests/pe-contract.py.
+all: kernel bios uefi iso pe-check
 
 help:
 	@echo "barryOS build targets:"
@@ -149,6 +152,13 @@ $(TEST_EXE): $(ROOT)/test/hello.c
 $(BOOTIMG_RS): $(MBR_BIN) $(STAGE2_BIN) $(TEST_EXE) $(ROOT)/scripts/gen-bootimg.py
 	cd $(ROOT) && $(PYTHON) scripts/gen-bootimg.py \
 	    build/mbr.bin build/stage2.bin build/hello.exe
+
+# The loader refuses any image it cannot rebase and any import its table does
+# not know.  Both are silent at build time and loud at boot time, and there is
+# no hypervisor in CI to boot and find out -- so check the contract directly
+# against the real bytes of the real test program.
+pe-check: $(TEST_EXE)
+	cd $(ROOT) && $(PYTHON) tests/pe-contract.py build/hello.exe kernel/src/compat/win32.rs
 
 $(BIOS_IMG): $(MBR_BIN) $(STAGE2_BIN) $(KERN_BIN)
 	# Tell the loader how big the kernel is.  Written to a *copy*: stage2.bin
