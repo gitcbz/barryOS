@@ -74,10 +74,27 @@ static LAST_SEND: AtomicU64 = AtomicU64::new(0);
 static RETRIES: AtomicU32 = AtomicU32::new(0);
 static ISS: AtomicU32 = AtomicU32::new(0);
 
-static mut TX_SEG: [u8; MAX_SEG] = [0; MAX_SEG];
-static TX_LEN: AtomicU32 = AtomicU32::new(0);
-/// Set when the segment in TX_SEG carries FIN as well as data.
-static TX_FIN: AtomicBool = AtomicBool::new(false);
+/// The segments sent and not yet acknowledged, oldest first.
+///
+/// There was no queue here, and every new segment was stamped with `SND_UNA`
+/// — the sequence number of the oldest unacknowledged byte.  With one segment
+/// in flight that is the same number.  With three it is not: TLS 1.2's client
+/// flight is three records written back to back, all three went out claiming
+/// the same sequence number, and the server kept the first and discarded the
+/// rest as duplicates.  What that looks like from above is a Finished that was
+/// retransmitted six times and never arrived.
+///
+/// Eight slots, and `send` refuses rather than overwrites when they are full:
+/// a caller that is told no can wait, and a caller that is quietly dropped
+/// cannot tell the difference from one that was delivered.
+const TX_SLOTS: usize = 8;
+static mut TX_BUF: [u8; TX_SLOTS * MAX_SEG] = [0; TX_SLOTS * MAX_SEG];
+static mut TX_SLOT_SEQ: [u32; TX_SLOTS] = [0; TX_SLOTS];
+static mut TX_SLOT_LEN: [usize; TX_SLOTS] = [0; TX_SLOTS];
+static mut TX_SLOT_FIN: [bool; TX_SLOTS] = [false; TX_SLOTS];
+/// Oldest unacknowledged slot, and the next free one.  Equal means empty.
+static TX_HEAD: AtomicU32 = AtomicU32::new(0);
+static TX_TAIL: AtomicU32 = AtomicU32::new(0);
 
 /// The receive buffer, as a ring.
 ///
@@ -193,8 +210,8 @@ pub fn reset() {
     RX_TAIL.store(0, Ordering::Relaxed);
     RX_TRUNCATED.store(false, Ordering::Relaxed);
     PEER_CLOSED.store(false, Ordering::Relaxed);
-    TX_LEN.store(0, Ordering::Relaxed);
-    TX_FIN.store(false, Ordering::Relaxed);
+    TX_HEAD.store(0, Ordering::Relaxed);
+    TX_TAIL.store(0, Ordering::Relaxed);
     RETRIES.store(0, Ordering::Relaxed);
     VERBOSE.store(true, Ordering::Relaxed);
 }
@@ -235,7 +252,7 @@ pub fn connect(ip: [u8; 4], port: u16) -> bool {
     VERBOSE.store(true, Ordering::Relaxed);
     CONNECTS.fetch_add(1, Ordering::Relaxed);
 
-    if !send_segment(&[], true, false, false) {
+    if !emit(ISS.load(Ordering::Relaxed), 0x02, &[]) {
         // The only reason a send fails here is an unresolved next hop: `send`
         // fires an ARP request and returns false.  The connection is still
         // SynSent, so `tick` will send the SYN again a second later — which is
@@ -254,26 +271,32 @@ pub fn connect(ip: [u8; 4], port: u16) -> bool {
 }
 
 /// Queue and send `data` on the established connection.
+///
+/// One slot per call, and the slot keeps its sequence number for as long as it
+/// is unacknowledged.  Refuses when the queue is full rather than overwriting
+/// the oldest: the caller is a record layer that can send again next tick, and
+/// a silent drop here is a record that never arrives.
 pub fn send(data: &[u8]) -> bool {
     if state() != State::Established {
         return false;
     }
-    if data.len() > MAX_SEG {
+    if data.is_empty() || data.len() > MAX_SEG {
         return false;
     }
-    let base = core::ptr::addr_of_mut!(TX_SEG) as *mut u8;
+    if TX_TAIL.load(Ordering::Relaxed).wrapping_sub(TX_HEAD.load(Ordering::Relaxed))
+        >= TX_SLOTS as u32
+    {
+        return false;
+    }
+    let seq = SND_NXT.fetch_add(data.len() as u32, Ordering::Relaxed);
+    let slot = queue_slot(seq, data.len(), false);
+    let base = core::ptr::addr_of_mut!(TX_BUF) as *mut u8;
+    let at = slot * MAX_SEG;
     for (i, &b) in data.iter().enumerate() {
-        unsafe { core::ptr::write_volatile(base.add(i), b) };
+        unsafe { core::ptr::write_volatile(base.add(at + i), b) };
     }
-    TX_LEN.store(data.len() as u32, Ordering::Relaxed);
-    TX_FIN.store(false, Ordering::Relaxed);
     RETRIES.store(0, Ordering::Relaxed);
-
-    if !send_segment(&[], false, false, true) {
-        return false;
-    }
-    SND_NXT.fetch_add(data.len() as u32, Ordering::Relaxed);
-    true
+    emit_slot(slot as u32)
 }
 
 /// Say goodbye.  The connection is not gone until the peer's FIN arrives.
@@ -281,43 +304,56 @@ pub fn close() {
     if state() != State::Established {
         return;
     }
-    TX_LEN.store(0, Ordering::Relaxed);
-    TX_FIN.store(true, Ordering::Relaxed);
+    let seq = SND_NXT.fetch_add(1, Ordering::Relaxed);      // FIN takes one
+    let slot = queue_slot(seq, 0, true);
     STATE.store(state_to_u8(State::FinWait), Ordering::Relaxed);
-    SND_NXT.fetch_add(1, Ordering::Relaxed);        // FIN takes one
     RETRIES.store(0, Ordering::Relaxed);
-    send_segment(&[], false, true, true);
+    emit_slot(slot as u32);
 }
 
-/// Build and emit one segment.
-///
-/// `payload` is used when the caller already has the bytes in hand (the SYN,
-/// where there are none); `from_tx_buf` sends what is in TX_SEG, which is the
-/// retransmittable path.
-fn send_segment(payload: &[u8], syn: bool, fin: bool, from_tx_buf: bool) -> bool {
+/// Put an entry in the transmit queue and return its slot index.
+fn queue_slot(seq: u32, len: usize, fin: bool) -> usize {
+    let tail = TX_TAIL.load(Ordering::Relaxed);
+    let slot = (tail % TX_SLOTS as u32) as usize;
+    unsafe {
+        TX_SLOT_SEQ[slot] = seq;
+        TX_SLOT_LEN[slot] = len;
+        TX_SLOT_FIN[slot] = fin;
+    }
+    TX_TAIL.store(tail.wrapping_add(1), Ordering::Relaxed);
+    slot
+}
+
+/// Send the segment in one queue slot, as it stands.
+fn emit_slot(slot: u32) -> bool {
+    let i = (slot % TX_SLOTS as u32) as usize;
+    let (seq, len, fin) = unsafe { (TX_SLOT_SEQ[i], TX_SLOT_LEN[i], TX_SLOT_FIN[i]) };
+    emit(seq, 0x10 | if fin { 0x01 } else { 0 }, payload_of(i, len))
+}
+
+/// A view of a slot's payload.
+fn payload_of(slot: usize, len: usize) -> &'static [u8] {
+    let base = core::ptr::addr_of!(TX_BUF) as *const u8;
+    unsafe { core::slice::from_raw_parts(base.add(slot * MAX_SEG), len) }
+}
+
+/// Build and emit one segment with an explicit sequence number.
+fn emit(seq: u32, flags: u8, payload: &[u8]) -> bool {
     let src_port = LOCAL_PORT.load(Ordering::Relaxed) as u16;
     let dst_port = REMOTE_PORT.load(Ordering::Relaxed) as u16;
     let dst = arp::u32_to_ip(REMOTE_IP.load(Ordering::Relaxed));
 
-    let body_len = if from_tx_buf && !syn {
-        TX_LEN.load(Ordering::Relaxed) as usize
-    } else {
-        payload.len()
-    };
+    let body_len = payload.len();
 
     let mut seg = [0u8; 20 + MAX_SEG];
     seg[0..2].copy_from_slice(&src_port.to_be_bytes());
     seg[2..4].copy_from_slice(&dst_port.to_be_bytes());
 
-    let seq = if syn { ISS.load(Ordering::Relaxed) } else { SND_UNA.load(Ordering::Relaxed) };
     seg[4..8].copy_from_slice(&seq.to_be_bytes());
     seg[8..12].copy_from_slice(&RCV_NXT.load(Ordering::Relaxed).to_be_bytes());
 
     // Data offset 5 (20-byte header), then the flags.
     seg[12] = 5 << 4;
-    let mut flags = 0x10u8;                          // ACK is on everything but the first SYN
-    if syn { flags = 0x02; }
-    if fin { flags |= 0x01; }
     seg[13] = flags;
     // The window is what is actually free, not a constant.  A fixed number
     // tells the peer it may keep sending while the consumer has stopped, and
@@ -329,14 +365,7 @@ fn send_segment(payload: &[u8], syn: bool, fin: bool, from_tx_buf: bool) -> bool
     // Checksum at 16..18; urgent pointer zero.
 
     if body_len > 0 {
-        let base = core::ptr::addr_of!(TX_SEG) as *const u8;
-        for i in 0..body_len {
-            seg[20 + i] = if from_tx_buf {
-                unsafe { core::ptr::read_volatile(base.add(i)) }
-            } else {
-                payload[i]
-            };
-        }
+        seg[20..20 + body_len].copy_from_slice(payload);
     }
 
     let n = 20 + body_len;
@@ -400,7 +429,7 @@ fn send_ack() {
     if !matches!(state(), State::Established | State::FinWait | State::FinSent) {
         return;
     }
-    send_segment(&[], false, false, false);
+    emit(SND_NXT.load(Ordering::Relaxed), 0x10, &[]);
 }
 
 // --- receiving -------------------------------------------------------------
@@ -463,9 +492,8 @@ pub fn handle(src: [u8; 4], body: &[u8]) {
     }
 
     // Anything the peer has acknowledged is no longer outstanding.
-    if flags & 0x10 != 0 && ack == SND_NXT.load(Ordering::Relaxed) {
-        SND_UNA.store(ack, Ordering::Relaxed);
-        TX_LEN.store(0, Ordering::Relaxed);
+    if flags & 0x10 != 0 && ack.wrapping_sub(SND_UNA.load(Ordering::Relaxed)) < 0x8000_0000 {
+        ack_advance(ack);
         RETRIES.store(0, Ordering::Relaxed);
     }
 
@@ -520,9 +548,7 @@ pub fn handle(src: [u8; 4], body: &[u8]) {
                 send_ack();
             }
             // Wait for the server's FIN even after our FIN has been acked.
-            if state() == State::FinWait && TX_FIN.load(Ordering::Relaxed)
-                && SND_UNA.load(Ordering::Relaxed)
-                    == SND_NXT.load(Ordering::Relaxed)
+            if state() == State::FinWait && fin_acked()
             {
                 STATE.store(state_to_u8(State::FinSent), Ordering::Relaxed);
             }
@@ -550,6 +576,10 @@ fn append_rx(data: &[u8]) -> usize {
 
 /// Retransmit unacknowledged data, and give up on a connection that has gone
 /// quiet.
+///
+/// Everything outstanding goes again, from the oldest: the receiver has no
+/// reassembly queue, so a segment that arrived after a lost one was discarded
+/// and retransmitting only the newest would never fill the hole.
 pub fn tick() {
     if !ACTIVE.load(Ordering::Relaxed) {
         return;
@@ -558,33 +588,38 @@ pub fn tick() {
     if now.saturating_sub(LAST_SEND.load(Ordering::Relaxed)) < RETRY_TICKS {
         return;
     }
-    let outstanding = SND_NXT.load(Ordering::Relaxed) != SND_UNA.load(Ordering::Relaxed);
-    let waiting_fin = TX_FIN.load(Ordering::Relaxed) && state() == State::FinWait;
 
-    // What to send again, if anything.  A match on the state rather than a
-    // fall-through `else`: the old shape had "anything that is not a SYN and
-    // not a FIN" retransmitting the data buffer, which on a connection that
-    // never opened meant inventing an empty acknowledgement out of nothing and
-    // sending it six times.
-    let resend = match state() {
-        State::SynSent => Resend::Syn,
-        State::FinWait if waiting_fin => Resend::Fin,
-        State::Established if outstanding => Resend::Data,
-        _ => return,
-    };
+    let mut sent = 0u32;
+    if state() == State::SynSent {
+        // The SYN is not in the queue: it has no payload and its sequence
+        // number is the one the handshake started with.
+        if !emit(ISS.load(Ordering::Relaxed), 0x02, &[]) {
+            return;                     // the next hop is not resolved yet
+        }
+        sent = 1;
+    } else {
+        let head = TX_HEAD.load(Ordering::Relaxed);
+        let tail = TX_TAIL.load(Ordering::Relaxed);
+        if head == tail {
+            return;                     // nothing outstanding
+        }
+        let mut i = head;
+        while i != tail {
+            if !emit_slot(i) {
+                if sent == 0 {
+                    return;             // not one of them went out
+                }
+                break;
+            }
+            sent += 1;
+            i = i.wrapping_add(1);
+        }
+    }
 
     // A send that did not go out is not a retransmission: the next hop is not
     // resolved yet, and `ipv4::send` has just asked for it.  Counting it would
     // spend the retry budget on the seconds the network spent doing ARP.
-    let went = match resend {
-        Resend::Syn => send_segment(&[], true, false, false),
-        Resend::Fin => send_segment(&[], false, true, false),
-        Resend::Data => send_segment(&[], false, false, true),
-    };
-    if !went {
-        return;
-    }
-
+    let _ = sent;
     let n = RETRIES.fetch_add(1, Ordering::Relaxed) + 1;
     if n > MAX_RETRIES {
         serial::print_str("[tcp] gave up after ");
@@ -601,12 +636,35 @@ pub fn tick() {
     RETRANSMITS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// What a retransmission timer has to send again.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Resend {
-    Syn,
-    Fin,
-    Data,
+/// Retire every queued segment the peer has acknowledged, oldest first.
+fn ack_advance(ack: u32) {
+    let mut head = TX_HEAD.load(Ordering::Relaxed);
+    let tail = TX_TAIL.load(Ordering::Relaxed);
+    while head != tail {
+        let i = (head % TX_SLOTS as u32) as usize;
+        let (seq, len, fin) = unsafe { (TX_SLOT_SEQ[i], TX_SLOT_LEN[i], TX_SLOT_FIN[i]) };
+        // A FIN occupies one sequence number past its (empty) payload.
+        let span = len as u32 + if fin { 1 } else { 0 };
+        if ack.wrapping_sub(seq) >= span {
+            head = head.wrapping_add(1);
+        } else {
+            break;
+        }
+    }
+    TX_HEAD.store(head, Ordering::Relaxed);
+    // The oldest byte still outstanding is the front of the queue; with an
+    // empty queue everything sent has been acknowledged.
+    let una = if head == tail {
+        SND_NXT.load(Ordering::Relaxed)
+    } else {
+        unsafe { TX_SLOT_SEQ[(head % TX_SLOTS as u32) as usize] }
+    };
+    SND_UNA.store(una, Ordering::Relaxed);
+}
+
+/// Has everything we sent, the FIN included, been acknowledged?
+fn fin_acked() -> bool {
+    TX_HEAD.load(Ordering::Relaxed) == TX_TAIL.load(Ordering::Relaxed)
 }
 
 /// One line for a status bar or a log.

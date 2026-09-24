@@ -13,7 +13,7 @@
 
 use crate::crypto::der::{self, Reader, Tlv, TAG_BOOLEAN, TAG_INTEGER, TAG_OCTET_STRING,
                            TAG_OID, TAG_SEQUENCE, TAG_BIT_STRING};
-use crate::crypto::ec::{self, Ecdsa};
+use crate::crypto::ec::{self, Ec};
 use crate::crypto::rsa::{HashId, RsaPublic};
 
 // --- algorithm OIDs, as DER contents ---------------------------------------
@@ -293,9 +293,9 @@ pub fn verify_signed_by(child: &Cert, issuer: &Cert) -> bool {
         }
     } else if der::oid_is(issuer.key_alg, OID_EC) {
         let curve = if der::oid_is(issuer.curve, OID_P256) {
-            Ecdsa::new(&ec::P256)
+            Ec::new(&ec::P256)
         } else if der::oid_is(issuer.curve, OID_P384) {
-            Ecdsa::new(&ec::P384)
+            Ec::new(&ec::P384)
         } else {
             None
         };

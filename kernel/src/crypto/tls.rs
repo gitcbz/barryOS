@@ -17,6 +17,7 @@
 use crate::crypto::aes::{gcm_decrypt, gcm_encrypt};
 use crate::crypto::hkdf::{derive_secret, expand_label, extract};
 use crate::crypto::hmac::hmac;
+use crate::crypto::x509;
 use crate::crypto::x25519;
 use crate::sha256::Sha256;
 use crate::serial;
@@ -35,6 +36,13 @@ const HS_ENCRYPTED_EXTENSIONS: u8 = 8;
 const HS_CERTIFICATE: u8 = 11;
 const HS_CERTIFICATE_VERIFY: u8 = 15;
 const HS_FINISHED: u8 = 20;
+/// TLS 1.2 only.  These numbers are shared with 1.3's namespace, where they
+/// went unused — which is why a 1.3 client that sees one has a server that
+/// has not understood the version at all.
+const HS_SERVER_KEY_EXCHANGE: u8 = 12;
+const HS_CERTIFICATE_REQUEST: u8 = 13;
+const HS_SERVER_HELLO_DONE: u8 = 14;
+const HS_CLIENT_KEY_EXCHANGE: u8 = 16;
 
 /// TLS 1.3 cipher suites.  Only the SHA-256 one is offered or accepted: the
 /// whole key schedule is HKDF-SHA256 and the transcript is SHA-256, so a
@@ -43,8 +51,16 @@ const HS_FINISHED: u8 = 20;
 /// mistake that shows up as an unexplained decryption failure at the end.
 pub const SUITE_AES128_SHA256: u16 = 0x1301;
 
+/// The TLS 1.2 suites, which are a different list in the same message.  A
+/// server that cannot do 1.3 picks from these, and one that finds none of its
+/// own answers with `protocol_version` and hangs up — which is exactly what
+/// baidu.com did while this client offered 1.3 alone.
+use crate::crypto::tls12::{self, SUITE_ECDHE_ECDSA_AES128_GCM_SHA256,
+                            SUITE_ECDHE_RSA_AES128_GCM_SHA256};
+
 /// Named groups and signature schemes.
 const GROUP_X25519: u16 = 0x001d;
+const GROUP_SECP256R1: u16 = 0x0017;
 const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
 const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805;
 const SIG_RSA_PSS_RSAE_SHA512: u16 = 0x0806;
@@ -57,9 +73,10 @@ const SIG_RSA_PKCS1_SHA512: u16 = 0x0601;
 
 /// Extension types.
 const EXT_SERVER_NAME: u16 = 0x0000;
-const EXT_ALPN: u16 = 0x0010;
 const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
+const EXT_EC_POINT_FORMATS: u16 = 0x000b;
 const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
+const EXT_ALPN: u16 = 0x0010;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const EXT_KEY_SHARE: u16 = 0x0033;
 
@@ -139,6 +156,39 @@ static RX_TRUNCATED: AtomicBool = AtomicBool::new(false);
 /// The host being connected to, for SNI and for the certificate check.
 static mut HOST: [u8; 128] = [0; 128];
 static HOST_LEN: AtomicU32 = AtomicU32::new(0);
+
+/// The ClientHello's random.  TLS 1.2 signs it and derives from it; 1.3 only
+/// needs it to be unique.
+static mut CLIENT_RANDOM: [u8; 32] = [0; 32];
+
+/// Which handshake the ServerHello settled on: 0 undecided, 12 or 13.
+static VERSION: AtomicU8 = AtomicU8::new(0);
+/// Where the TLS 1.2 exchange has got to: 0 reading the server's flight,
+/// 1 having sent ours, 2 finished.
+static STEP12: AtomicU8 = AtomicU8::new(0);
+/// Is the 1.2 cipher spec in force in each direction?  Records are plaintext
+/// until the other end's ChangeCipherSpec has arrived.
+static CLIENT_CIPHER: AtomicBool = AtomicBool::new(false);
+static SERVER_CIPHER: AtomicBool = AtomicBool::new(false);
+/// The 1.2 handshake's keys and secrets.
+static mut HS12: tls12::Handshake = tls12::Handshake::EMPTY;
+
+/// Fill `out` with bytes that must not repeat between connections.
+///
+/// Not a cryptographic generator, and it does not claim to be: what it has to
+/// do is differ every time.  The cycle counter does, and it is mixed so that
+/// two calls in the same microsecond do not return the same bytes.
+pub fn random_bytes(out: &mut [u8]) {
+    let mut s = unsafe { core::arch::x86_64::_rdtsc() }
+        ^ (crate::interrupts::TIMER_TICKS.load(Ordering::Relaxed) as u64).rotate_left(29)
+        ^ core::ptr::addr_of!(TRANSCRIPT) as u64;
+    for b in out.iter_mut() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        *b = (s & 0xFF) as u8;
+    }
+}
 
 /// The port to connect to.  Kept rather than assumed: the DNS path used to
 /// connect to 443 unconditionally, which is invisible when 443 is the only
@@ -274,8 +324,14 @@ fn reset() {
         S_HS_SECRET = [0; 32];
         PRIV = [0; 32];
         PUB = [0; 32];
+        CLIENT_RANDOM = [0; 32];
+        HS12 = tls12::Handshake::EMPTY;
     }
     HAVE_HS.store(false, Ordering::Relaxed);
+    VERSION.store(0, Ordering::Relaxed);
+    STEP12.store(0, Ordering::Relaxed);
+    CLIENT_CIPHER.store(false, Ordering::Relaxed);
+    SERVER_CIPHER.store(false, Ordering::Relaxed);
     crate::net::tcp::reset();
 }
 
@@ -319,6 +375,15 @@ pub fn tick() {
         Phase::Handshaking => {
             crate::net::tcp::tick();
             drain_tcp();
+            // TLS 1.2 is a request-and-reply exchange: once ServerHelloDone
+            // has been read, everything the client owes can go at once and
+            // does not depend on anything the server has yet to say.
+            if cipher_spec_for_version() && STEP12.load(Ordering::Relaxed) == 1 {
+                STEP12.store(2, Ordering::Relaxed);
+                if !send_flight12() {
+                    return;
+                }
+            }
             if crate::net::tcp::state() == crate::net::tcp::State::Failed {
                 fail(6);
             } else if !established()
@@ -352,6 +417,9 @@ pub fn tick() {
 
 /// Write a handshake record, encrypted or not depending on the phase.
 fn send_record(content_type: u8, body: &[u8]) -> bool {
+    if cipher_spec_for_version() {
+        return send_record12(content_type, body);
+    }
     let inner_buf;
     let mut buf = [0u8; 16640];
     let mut n = 0usize;
@@ -440,9 +508,47 @@ fn drain_tcp() {
         }
         consumed += 5 + len;
 
+        // A ChangeCipherSpec in TLS 1.2 is a record in its own right, sent in
+        // clear, and it is what puts the new cipher spec in force — including
+        // starting the read sequence number over at zero.  It carries no
+        // handshake message and does not go into the transcript.
+        if cipher_spec_for_version() && hdr[0] == CT_CHANGE_CIPHER_SPEC {
+            SERVER_CIPHER.store(true, Ordering::Relaxed);
+            SERVER_SEQ.store(0, Ordering::Relaxed);
+            serial::print_str("[tls] TLS 1.2 ChangeCipherSpec received\n");
+            continue;
+        }
+
         // An encrypted record is always typed as application_data on the
         // outside; the real type is the last byte of the plaintext.
-        let (ctype, plen) = if hdr[0] == CT_APPLICATION_DATA {
+        let (ctype, plen) = if cipher_spec_for_version() && SERVER_CIPHER.load(Ordering::Relaxed) {
+            // TLS 1.2 AEAD (RFC 5288): an eight-byte explicit nonce on the
+            // front, then the ciphertext, then the tag.  The implicit half of
+            // the nonce comes from the key block and never moves.
+            if len < 8 + 16 {
+                log_record("an encrypted record too short to hold a nonce", &hdr, len);
+                fail(7);
+                return;
+            }
+            let h = unsafe { &*core::ptr::addr_of!(HS12) };
+            let mut rec = [0u8; 16640];
+            crate::net::tcp::rx_read_at(consumed - len, &mut rec[..len]);
+            let mut nonce = [0u8; 12];
+            nonce[..4].copy_from_slice(&h.server_iv);
+            nonce[4..].copy_from_slice(&rec[..8]);
+            let seq = SERVER_SEQ.fetch_add(1, Ordering::Relaxed);
+            let plain_len = len - 8 - 16;
+            let aad = aad12(seq, hdr[0], plain_len);
+            let out = plain_buf();
+            match gcm_decrypt(&h.server_key, &nonce, &aad, &rec[8..len], out) {
+                Some(m) if m == plain_len => (hdr[0], m),
+                _ => {
+                    log_record("record did not authenticate", &hdr, len);
+                    fail(7);
+                    return;
+                }
+            }
+        } else if hdr[0] == CT_APPLICATION_DATA && !cipher_spec_for_version() {
             let keys = unsafe {
                 if !established() && SERVER_HS.key_len != 0 { &SERVER_HS } else { &SERVER_AP }
             };
@@ -706,18 +812,7 @@ fn send_client_hello() {
     // A fresh ephemeral key per connection.  The private half never leaves
     // this buffer and the public half is what goes on the wire.
     let mut priv_key = [0u8; 32];
-    let seed = unsafe { core::arch::x86_64::_rdtsc() };
-    let mut s = seed;
-    for b in priv_key.iter_mut() {
-        // xorshift64: this is a key that must not repeat between connections,
-        // not one that must be unpredictable to an attacker who cannot see
-        // the traffic.  It is mixed with the cycle counter, which differs
-        // every time.
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        *b = (s & 0xFF) as u8;
-    }
+    random_bytes(&mut priv_key);
     let pub_key = x25519::public_key(&priv_key);
     unsafe {
         PRIV = priv_key;
@@ -729,16 +824,24 @@ fn send_client_hello() {
     // legacy_version is pinned to 1.2 for middleboxes; the real version is in
     // supported_versions.
     push_u16(&mut b, &mut n, 0x0303);
-    // random: 32 bytes.  Only needs to be unique, and the cycle counter is.
-    let r = unsafe { core::arch::x86_64::_rdtsc() };
-    for i in 0..32 {
-        b[n] = ((r >> ((i % 8) * 8)) ^ (i as u64 * 31)) as u8;
-        n += 1;
+    // random: 32 bytes.  Only needs to be unique.  Kept, because TLS 1.2 signs
+    // it into the key exchange and derives the master secret from it.
+    {
+        let mut r = [0u8; 32];
+        random_bytes(&mut r);
+        unsafe { CLIENT_RANDOM = r };
+        b[n..n + 32].copy_from_slice(&r);
+        n += 32;
     }
     b[n] = 0;                       // empty session id
     n += 1;
-    push_u16(&mut b, &mut n, 2);    // one cipher suite
+    // Cipher suites: 1.3 first, then the 1.2 AEAD pair.  A 1.3 server takes
+    // the first and ignores the rest; a 1.2 server finds nothing it knows in
+    // the first and picks from the others.
+    push_u16(&mut b, &mut n, 6);
     push_u16(&mut b, &mut n, SUITE_AES128_SHA256);
+    push_u16(&mut b, &mut n, SUITE_ECDHE_ECDSA_AES128_GCM_SHA256);
+    push_u16(&mut b, &mut n, SUITE_ECDHE_RSA_AES128_GCM_SHA256);
     b[n] = 1;                       // one compression method: null
     n += 1;
     b[n] = 0;
@@ -762,11 +865,29 @@ fn send_client_hello() {
         ext_end(&mut b, &n, at);
     }
 
-    // supported_groups: x25519 only, which is what we can do.
+    // supported_groups: x25519 first, because that is the group the key share
+    // below is for and a 1.3 server must be able to take it without a retry.
+    // P-256 is here for TLS 1.2, where x25519 is not universally accepted —
+    // baidu.com's 1.2 stack refuses it outright.
     {
         let at = ext_begin(&mut b, &mut n, EXT_SUPPORTED_GROUPS);
-        push_u16(&mut b, &mut n, 2);
+        let list_at = n;
+        push_u16(&mut b, &mut n, 0);
         push_u16(&mut b, &mut n, GROUP_X25519);
+        push_u16(&mut b, &mut n, GROUP_SECP256R1);
+        let l = (n - list_at - 2) as u16;
+        b[list_at..list_at + 2].copy_from_slice(&l.to_be_bytes());
+        ext_end(&mut b, &n, at);
+    }
+
+    // ec_point_formats: uncompressed only.  1.2 servers are entitled to
+    // require this extension rather than assume its default.
+    {
+        let at = ext_begin(&mut b, &mut n, EXT_EC_POINT_FORMATS);
+        b[n] = 1;
+        n += 1;
+        b[n] = 0;                   // uncompressed
+        n += 1;
         ext_end(&mut b, &n, at);
     }
 
@@ -800,14 +921,16 @@ fn send_client_hello() {
         ext_end(&mut b, &n, at);
     }
 
-    // supported_versions: 1.3 only.  Offering 1.2 as well would mean the
-    // server could pick it, and the 1.2 handshake is a different state
-    // machine; this client says what it can actually do.
+    // supported_versions: 1.3 preferred, 1.2 acceptable.  A server that
+    // understands this extension — which every 1.3 server does, and which
+    // RFC 8446 defines for 1.2 servers to ignore or answer — replies with its
+    // choice.  Listing only 1.3 was what made a 1.2-only server refuse.
     {
         let at = ext_begin(&mut b, &mut n, EXT_SUPPORTED_VERSIONS);
-        b[n] = 2;
+        b[n] = 4;
         n += 1;
         push_u16(&mut b, &mut n, 0x0304);
+        push_u16(&mut b, &mut n, 0x0303);
         ext_end(&mut b, &n, at);
     }
 
@@ -872,7 +995,46 @@ fn ext_end(b: &mut [u8], n: &usize, at: usize) {
     b[at..at + 2].copy_from_slice(&l.to_be_bytes());
 }
 
-/// Process one or more handshake messages from a record.
+/// Which handshake a ServerHello is announcing.
+///
+/// A 1.3 server says so in `supported_versions` and nowhere else — its
+/// legacy_version is 0x0303 like everyone else's, because that field is the
+/// one middleboxes read.  So the extension is the answer, and its absence is
+/// the answer too: a server that did not send it is not 1.3.
+fn server_hello_version(body: &[u8]) -> u16 {
+    let mut at = 0usize;
+    if body.len() < 38 {
+        return 0;
+    }
+    at = 2 + 32;
+    let sid = body[at] as usize;
+    at += 1 + sid;
+    if at + 3 > body.len() {
+        return 0;
+    }
+    at += 2;                        // cipher suite
+    at += 1;                        // compression
+    if at + 2 > body.len() {
+        return 0;
+    }
+    at += 2;                        // the extensions block's own length
+    while at + 4 <= body.len() {
+        let et = u16::from_be_bytes([body[at], body[at + 1]]);
+        let el = u16::from_be_bytes([body[at + 2], body[at + 3]]) as usize;
+        at += 4;
+        if at + el > body.len() {
+            return 0;
+        }
+        if et == EXT_SUPPORTED_VERSIONS && el >= 2 {
+            return u16::from_be_bytes([body[at], body[at + 1]]);
+        }
+        at += el;
+    }
+    0
+}
+
+/// Process one or more handshake messages from a record.  Which handshake is
+/// decided by the ServerHello, and cannot be known before it.
 fn handle_handshake(data: &[u8]) {
     let mut at = 0usize;
     while at + 4 <= data.len() {
@@ -887,6 +1049,19 @@ fn handle_handshake(data: &[u8]) {
         let msg = &data[at..at + 4 + len];
         at += 4 + len;
 
+        // The ServerHello is the only message that is read the same way by
+        // both versions, and it is what tells us which one we are in.
+        if t == HS_SERVER_HELLO && VERSION.load(Ordering::Relaxed) == 0 {
+            let v = server_hello_version(&msg[4..]);
+            VERSION.store(if v == 0x0304 { 13 } else { 12 }, Ordering::Relaxed);
+        }
+        if VERSION.load(Ordering::Relaxed) == 12 {
+            if !handle_handshake12(msg) {
+                return;
+            }
+            continue;
+        }
+
         match t {
             HS_SERVER_HELLO => {
                 transcript_update(msg);
@@ -899,7 +1074,7 @@ fn handle_handshake(data: &[u8]) {
             }
             HS_CERTIFICATE => {
                 transcript_update(msg);
-                if !handle_certificate(&msg[4..]) {
+                if !handle_certificate(&msg[4..], true) {
                     return;
                 }
             }
@@ -928,6 +1103,238 @@ fn handle_handshake(data: &[u8]) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+//  TLS 1.2
+// ---------------------------------------------------------------------------
+
+/// One TLS 1.2 handshake message.
+///
+/// The order is fixed and nothing is optional once it starts: ServerHello,
+/// Certificate, ServerKeyExchange, [CertificateRequest], ServerHelloDone.
+/// There is no encryption before the ChangeCipherSpec, so all of this is
+/// plaintext on the wire — which is the 1.3 objection to this protocol, and
+/// not something this end can do anything about.
+fn handle_handshake12(msg: &[u8]) -> bool {
+    let h = unsafe { &mut *core::ptr::addr_of_mut!(HS12) };
+    match msg[0] {
+        HS_SERVER_HELLO => {
+            transcript_update(msg);
+            // The client's random is half of what the server signs in
+            // ServerKeyExchange and half of the master secret's seed, so it
+            // has to be here before either is looked at.
+            h.client_random = unsafe { CLIENT_RANDOM };
+            if !h.server_hello(&msg[4..]) {
+                return fail12(h.why);
+            }
+            serial::print_str("[tls] TLS 1.2, cipher suite 0x");
+            serial::print_hex(h.suite as u64);
+            serial::print_str("\n");
+            true
+        }
+        HS_CERTIFICATE => {
+            transcript_update(msg);
+            // No certificate_request_context in this version.
+            if !handle_certificate(&msg[4..], false) {
+                return false;
+            }
+            // Checked here rather than at the end, because everything after
+            // this point is signed by the key in this certificate — a
+            // signature that verifies under a certificate nobody trusts is
+            // not evidence of anything.
+            chain_and_name_ok()
+        }
+        HS_SERVER_KEY_EXCHANGE => {
+            transcript_update(msg);
+            let der = leaf_der();
+            let Some(leaf) = x509::parse(der) else {
+                return fail12("the certificate did not parse");
+            };
+            // The borrow of CHAIN has to end before the handshake is touched.
+            let (alg, curve, key) = (leaf.key_alg, leaf.curve, leaf.key);
+            if !h.server_key_exchange(&msg[4..], alg, curve, key) {
+                return fail12(h.why);
+            }
+            serial::print_str("[tls] TLS 1.2 key exchange, group 0x");
+            serial::print_hex(h.group as u64);
+            serial::print_str(", signature verified\n");
+            true
+        }
+        HS_CERTIFICATE_REQUEST => {
+            transcript_update(msg);
+            // We have no certificate and will send an empty one.  A server
+            // that insists will say so when it rejects the Finished.
+            h.want_client_cert = true;
+            true
+        }
+        HS_SERVER_HELLO_DONE => {
+            transcript_update(msg);
+            if !h.derive_keys() {
+                return fail12(h.why);
+            }
+            serial::print_str("[tls] TLS 1.2 keys derived\n");
+            STEP12.store(1, Ordering::Relaxed);
+            true
+        }
+        HS_FINISHED => server_finished12(msg),
+        _ => {
+            transcript_update(msg);
+            true
+        }
+    }
+}
+
+/// Report a TLS 1.2 fault with its reason, and tear the connection down.
+fn fail12(why: &str) -> bool {
+    serial::print_str("[tls] ");
+    serial::print_str(if why.is_empty() { "the TLS 1.2 handshake failed" } else { why });
+    serial::print_str("\n");
+    fail(2);
+    false
+}
+
+/// ClientKeyExchange, ChangeCipherSpec, Finished — the client's whole flight,
+/// sent together because nothing in it depends on a reply.
+fn send_flight12() -> bool {
+    let h = unsafe { &*core::ptr::addr_of!(HS12) };
+
+    if h.want_client_cert {
+        // An empty Certificate: a three-byte list length of zero.  The
+        // alternative is a certificate this kernel does not have and could
+        // not keep secret if it did.
+        let empty = [HS_CERTIFICATE, 0, 0, 3, 0, 0, 0];
+        transcript_update(&empty);
+        if !send_record(CT_HANDSHAKE, &empty) {
+            return fail12("could not send the empty certificate");
+        }
+    }
+
+    let mut body = [0u8; 128];
+    let n = tls12::client_key_exchange(&mut body, h.group, &h.our_public[..h.our_public_len]);
+    if n == 0 {
+        return fail12("could not build the key exchange");
+    }
+    let mut cke = [0u8; 256];
+    let Some(m) = tls12::wrap(16, &body[..n], &mut cke) else {
+        return fail12("the key exchange did not fit");
+    };
+    transcript_update(&cke[..m]);
+    if !send_record(CT_HANDSHAKE, &cke[..m]) {
+        return fail12("could not send the key exchange");
+    }
+
+    // ChangeCipherSpec is a record, not a handshake message, so it is not in
+    // the transcript — but it does put the new cipher spec in force, which
+    // resets the write sequence number to zero.
+    if !send_record(CT_CHANGE_CIPHER_SPEC, &[1]) {
+        return fail12("could not send ChangeCipherSpec");
+    }
+    CLIENT_CIPHER.store(true, Ordering::Relaxed);
+    CLIENT_SEQ.store(0, Ordering::Relaxed);
+
+    // Finished: twelve bytes of PRF over the transcript up to here, including
+    // everything this flight put in it and not including the message itself.
+    let th = transcript_hash();
+    let mut verify = [0u8; 12];
+    h.finished_verify_data(b"client finished", &th, &mut verify);
+    let mut fin = [0u8; 16];
+    let Some(m) = tls12::wrap(20, &verify, &mut fin) else {
+        return fail12("the Finished did not fit");
+    };
+    if !send_record(CT_HANDSHAKE, &fin[..m]) {
+        return fail12("could not send the client Finished");
+    }
+    transcript_update(&fin[..m]);
+    serial::print_str("[tls] TLS 1.2 client flight sent\n");
+    true
+}
+
+/// The server's Finished, and with it the end of the handshake.
+fn server_finished12(msg: &[u8]) -> bool {
+    let h = unsafe { &*core::ptr::addr_of!(HS12) };
+    if msg.len() != 16 {
+        return fail12("the server's Finished is the wrong length");
+    }
+    // The transcript for the server's Finished includes the client's, which
+    // was added when it was sent.
+    let th = transcript_hash();
+    let mut want = [0u8; 12];
+    h.finished_verify_data(b"server finished", &th, &mut want);
+    if !crate::sha256::constant_time_eq(&want, &msg[4..16]) {
+        return fail12("the server's Finished did not verify");
+    }
+    transcript_update(msg);
+    STEP12.store(3, Ordering::Relaxed);
+    VERIFIED.store(true, Ordering::Relaxed);
+    PHASE.store(phase_to_u8(Phase::Established), Ordering::Relaxed);
+    serial::print_str("[tls] handshake complete, ");
+    serial::print_str(host_str());
+    serial::print_str(" verified (TLS 1.2)\n");
+    true
+}
+
+/// The additional data a TLS 1.2 AEAD record authenticates: the sequence
+/// number, the content type, the version, and the length of the *plaintext*.
+///
+/// The sequence number being inside the authenticated data rather than folded
+/// into the nonce is the structural difference from 1.3, and it is why a
+/// reordered record fails here rather than decrypting to garbage.
+fn aad12(seq: u32, kind: u8, plain_len: usize) -> [u8; 13] {
+    let s = (seq as u64).to_be_bytes();
+    [s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+     kind, 0x03, 0x03, (plain_len >> 8) as u8, plain_len as u8]
+}
+
+/// One TLS 1.2 record out.
+fn send_record12(kind: u8, body: &[u8]) -> bool {
+    let mut buf = [0u8; 16640];
+    let n;
+    if !CLIENT_CIPHER.load(Ordering::Relaxed) {
+        if 5 + body.len() > buf.len() {
+            return false;
+        }
+        buf[0] = kind;
+        buf[1] = 0x03;
+        buf[2] = 0x03;
+        buf[3..5].copy_from_slice(&(body.len() as u16).to_be_bytes());
+        buf[5..5 + body.len()].copy_from_slice(body);
+        n = 5 + body.len();
+    } else {
+        let h = unsafe { &*core::ptr::addr_of!(HS12) };
+        let seq = CLIENT_SEQ.fetch_add(1, Ordering::Relaxed);
+        // nonce = the implicit half from the key block, then an explicit half
+        // that goes on the wire.  Sending the sequence number makes the nonce
+        // unique without either end having to keep state the other cannot see.
+        let explicit = (seq as u64).to_be_bytes();
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&h.client_iv);
+        nonce[4..].copy_from_slice(&explicit);
+        let aad = aad12(seq, kind, body.len());
+
+        let mut ct = [0u8; 16640];
+        if !gcm_encrypt(&h.client_key, &nonce, &aad, body, &mut ct) {
+            return false;
+        }
+        let frag = 8 + body.len() + 16;
+        if 5 + frag > buf.len() {
+            return false;
+        }
+        buf[0] = kind;
+        buf[1] = 0x03;
+        buf[2] = 0x03;
+        buf[3..5].copy_from_slice(&(frag as u16).to_be_bytes());
+        buf[5..13].copy_from_slice(&explicit);
+        buf[13..13 + body.len() + 16].copy_from_slice(&ct[..body.len() + 16]);
+        n = 5 + frag;
+    }
+    crate::net::tcp::send(&buf[..n])
+}
+
+/// Tell the connection whether the write side is now using the 1.2 cipher
+/// spec, which is what `send_record` branches on.
+fn cipher_spec_for_version() -> bool {
+    VERSION.load(Ordering::Relaxed) == 12
 }
 
 fn handle_server_hello(body: &[u8]) -> bool {
@@ -1060,16 +1467,24 @@ fn make_keys(secret: &[u8; 32], key_len: usize) -> Keys {
 
 /// The server's chain.  Held as one buffer; the parse happens in the verify
 /// step so a malformed chain fails there rather than here.
-fn handle_certificate(body: &[u8]) -> bool {
+///
+/// `with_context` is the one place the two versions' Certificate messages
+/// differ: TLS 1.3 puts a `certificate_request_context` in front of the list,
+/// and TLS 1.2 does not.  Reading a byte that is really the top of the list
+/// length shifts everything by one and the parse fails with a message about
+/// the chain rather than about the offset.
+fn handle_certificate(body: &[u8], with_context: bool) -> bool {
     if body.is_empty() {
         fail(4);
         return false;
     }
     let mut at = 0usize;
-    // A certificate_request_context, then the list.
-    let ctx_len = body[at] as usize;
-    at += 1 + ctx_len;
+    if with_context {
+        let ctx_len = body[at] as usize;
+        at += 1 + ctx_len;
+    }
     if at + 3 > body.len() {
+        serial::print_str("[tls] certificate list header does not fit\n");
         fail(4);
         return false;
     }
@@ -1078,6 +1493,11 @@ fn handle_certificate(body: &[u8]) -> bool {
         | body[at + 2] as usize;
     at += 3;
     if at + list_len > body.len() {
+        serial::print_str("[tls] certificate list length ");
+        serial::print_dec(list_len as u64);
+        serial::print_str(" does not fit in ");
+        serial::print_dec(body.len() as u64);
+        serial::print_str(" bytes\n");
         fail(4);
         return false;
     }
@@ -1094,6 +1514,17 @@ fn handle_certificate(body: &[u8]) -> bool {
             | body[at + 2] as usize;
         at += 3;
         if at + cl > end || out + 4 + cl > CHAIN_CAP {
+            serial::print_str("[tls] certificate entry does not fit: at ");
+            serial::print_dec(at as u64);
+            serial::print_str(" cert ");
+            serial::print_dec(cl as u64);
+            serial::print_str(" end ");
+            serial::print_dec(end as u64);
+            serial::print_str(" body ");
+            serial::print_dec(body.len() as u64);
+            serial::print_str(" out ");
+            serial::print_dec(out as u64);
+            serial::print_str("\n");
             fail(4);
             return false;
         }
@@ -1107,8 +1538,10 @@ fn handle_certificate(body: &[u8]) -> bool {
         out += 4 + cl;
         at += cl;
         count += 1;
-        // The extensions after each entry are skipped by the length prefix.
-        if at + 2 <= end {
+        // TLS 1.3 puts extensions after each entry; TLS 1.2's entry is the
+        // certificate and nothing else.  Skipping two bytes that are really
+        // the next entry's length walks off the end of the list.
+        if with_context && at + 2 <= end {
             let el = u16::from_be_bytes([body[at], body[at + 1]]) as usize;
             at += 2 + el;
         }
@@ -1192,9 +1625,33 @@ fn handle_certificate_verify(body: &[u8]) -> bool {
     true
 }
 
+/// Is the server's certificate chain rooted somewhere we trust, and does the
+/// certificate name the host we asked for?
+///
+/// TLS 1.2 checks this as soon as the Certificate arrives, because everything
+/// after it is signed by that key; 1.3 checks it as part of CertificateVerify,
+/// because there the key is proved by the same message that uses it.  The two
+/// tests are the same two tests either way.
+fn chain_and_name_ok() -> bool {
+    let der = leaf_der();
+    let Some(leaf) = x509::parse(der) else {
+        serial::print_str("[tls] the server's certificate did not parse\n");
+        return false;
+    };
+    if !chain_trusted(&leaf) {
+        return false;
+    }
+    if !x509::hostname_matches(&leaf, host_str()) {
+        serial::print_str("[tls] certificate is not for ");
+        serial::print_str(host_str());
+        serial::print_str("\n");
+        return false;
+    }
+    true
+}
+
 /// The end-entity certificate as it arrived, for the trace.
-fn leaf_der() -> &'static [u8] {
-    let base = core::ptr::addr_of!(CHAIN) as *const u8;
+fn leaf_der() -> &'static [u8] {    let base = core::ptr::addr_of!(CHAIN) as *const u8;
     let total = CHAIN_LEN.load(Ordering::Relaxed) as usize;
     if total < 4 {
         return &[];
@@ -1239,15 +1696,7 @@ fn verify_with_chain(signed: &[u8], sig: &[u8], scheme: u16) -> bool {
 
     // The chain has to check out to a root before the signature is even
     // looked at: a valid signature by an untrusted key proves nothing.
-    if !chain_trusted(&leaf) {
-        return false;
-    }
-
-    // And the name in the certificate has to be the name we asked for.
-    if !x509::hostname_matches(&leaf, host_str()) {
-        serial::print_str("[tls] certificate is not for ");
-        serial::print_str(host_str());
-        serial::print_str("\n");
+    if !chain_and_name_ok() {
         return false;
     }
 
@@ -1269,9 +1718,9 @@ fn verify_with_chain(signed: &[u8], sig: &[u8], scheme: u16) -> bool {
 
     if crate::crypto::der::oid_is(leaf.key_alg, x509::OID_EC) {
         let curve = if crate::crypto::der::oid_is(leaf.curve, x509::OID_P256) {
-            crate::crypto::ec::Ecdsa::new(&crate::crypto::ec::P256)
+            crate::crypto::ec::Ec::new(&crate::crypto::ec::P256)
         } else if crate::crypto::der::oid_is(leaf.curve, x509::OID_P384) {
-            crate::crypto::ec::Ecdsa::new(&crate::crypto::ec::P384)
+            crate::crypto::ec::Ec::new(&crate::crypto::ec::P384)
         } else {
             None
         };

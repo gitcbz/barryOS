@@ -45,9 +45,14 @@ pub fn from_be_bytes(bytes: &[u8]) -> (Big, usize) {
     (out, used)
 }
 
-/// Write limbs back out big-endian, exactly `len` bytes.
-pub fn to_be_bytes(a: &Big, n: usize, out: &mut [u8]) {
-    let bytes = n * 8;
+/// Write limbs back out big-endian, exactly `limbs * 8` bytes.
+///
+/// The count is in limbs, not bytes, and `out` must be at least that long:
+/// a caller that passes a byte count gets eight times the output and fills it
+/// from limbs past the end, which reads as zero — the right shape, quietly the
+/// wrong number.
+pub fn to_be_bytes(a: &Big, limbs: usize, out: &mut [u8]) {
+    let bytes = limbs * 8;
     for i in 0..out.len().min(bytes) {
         // Byte i counts from the most significant end.
         let from_low = bytes - 1 - i;

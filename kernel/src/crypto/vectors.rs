@@ -108,3 +108,38 @@ pub const RSA_PSS_SHA256_SIG_TAMPERED: &[u8] = b"917511e7801830533c1941bff68bc8e
     7de0465f313202540751c1a6ceddbd8e282512d61271bddb62a3e7de39040ee4
     95065fb316764701243e06f0f3b33db6a6c08cb6e860b3d0930764c3e2c1a315
 ";
+
+/// TLS 1.2's PRF (RFC 5246 §5), checked against the same construction written
+/// out in Python.
+///
+/// The second case expands 32 bytes into 96, so the A(i) chain has to run past
+/// one block — a PRF that stops after the first HMAC, or that forgets to feed
+/// A(i-1) forward, matches the first case and not the second.
+pub struct Tls12PrfVector {
+    pub name: &'static str,
+    /// The secret, as HMAC key.
+    pub secret: &'static [u8],
+    /// The label, hashed into the seed as an ASCII string.
+    pub label: &'static str,
+    /// The seed that follows the label.
+    pub seed: &'static [u8],
+    /// The expected output.
+    pub want: &'static [u8],
+}
+
+pub const TLS12_PRF: &[Tls12PrfVector] = &[
+    Tls12PrfVector {
+        name: "tls 1.2 prf, one block",
+        secret: b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+        label: "master secret",
+        seed: b"01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3ba",
+        want: b"1e193a96f6e9cd8dc4cf7903f019aac556dbc81710d5258dd2bccd0a2eb1cb01361abc68e28fbd1c6e3cc4abcb7c9341",
+    },
+    Tls12PrfVector {
+        name: "tls 1.2 prf, across blocks",
+        secret: b"030e19242f3a45505b66717c87929da8b3bec9d4dfeaf5000b16212c37424d58",
+        label: "key expansion",
+        seed: b"05121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98a5b2bfccd9e6f3000d1a2734414e5b6875828f9ca9b6c3d0ddeaf704111e2b38",
+        want: b"489ced884d8b3df9c3a6920e0a849b21f37c37147b9998647d683c205392165a44f50711a4fe81d0c02c58bd4f757583acd200255a1e9f8b625699028dfd11ad3f7dbb46ff02f0d5b7f2ad98e65038373fd314dac956d88c98bb303b43809b5c",
+    },
+];

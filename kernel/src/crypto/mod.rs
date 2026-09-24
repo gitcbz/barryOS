@@ -21,6 +21,7 @@ pub mod hmac;
 pub mod rsa;
 pub mod sha512;
 pub mod tls;
+pub mod tls12;
 pub mod x25519;
 pub mod vectors;
 pub mod trust;
@@ -92,6 +93,7 @@ pub fn init() {
     failures += der::selftest();
     failures += x509::selftest();
     failures += trust::selftest();
+    failures += tls12::selftest();
 
     if failures == 0 {
         SOUND.store(true, Ordering::Release);

@@ -45,6 +45,18 @@ mod serial {
     pub fn init() {}
 }
 
+/// The kernel's tick counter, which the crypto uses as one of its sources of
+/// variation.  A monotonic counter here, so a value that changes reliably in
+/// the kernel does not become a constant in the test.
+mod interrupts {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn bump() {
+        TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 mod net {
     pub mod arp {
         /// The kernel's own dotted-quad parser is pure, so it is used here
@@ -362,6 +374,7 @@ fn fetch(spec: &str) -> bool {
             dump_trace(host);
             return false;
         }
+        interrupts::bump();
         std::thread::sleep(Duration::from_micros(500));
     }
     let handshake = start.elapsed();

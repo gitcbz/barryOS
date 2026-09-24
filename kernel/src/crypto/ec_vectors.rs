@@ -42,3 +42,33 @@ pub const EC_VECTORS: &[EcVector] = &[
     EcVector { name: "ROOT_A", curve: "P-384", hash: "sha384",
         pubkey: ROOT_A_PUB, signed: ROOT_A_TBS, sig: ROOT_A_SIG },
 ];
+
+/// One P-256 key agreement: a private scalar and what it produces.
+///
+/// Generated with OpenSSL rather than by this code, for the same reason the
+/// signatures above are real ones: `d·(d'·G)` agreeing with `d'·(d·G)` proves
+/// only that the multiplication is self-consistent, and a scalar multiplication
+/// that is wrong in a consistent way — a bad doubling formula, a ladder that
+/// skips a bit — passes that test and fails every server.  The expected values
+/// here come from outside.
+pub struct EcdhVector {
+    pub name: &'static str,
+    /// The private scalar.
+    pub scalar: &'static [u8],
+    /// scalar·G, uncompressed.
+    pub public: &'static [u8],
+    /// The peer's public point, uncompressed.
+    pub peer: &'static [u8],
+    /// The x-coordinate of scalar·peer.
+    pub shared_x: &'static [u8],
+}
+
+const P256_D: &[u8] = b"4c5b9c8e3f2a1d0b7e6f5a4c3b2a1908f7e6d5c4b3a29180ffeeddccbbaa9988";
+const P256_DG: &[u8] = b"04225b54aa7ab79e895fa464e95cef62e8b1643742de50b72e88320761a6d6c2385e1cac8bcef0db68bfacb6961fb00be9f7a5a799ac4db89ca0a1642679c0c749";
+const P256_PEER: &[u8] = b"046413e370318a922cecfaa94ba2188dd419f586356fa774c766cd6c450295fee95dce9ce0557b0a8f1cef5c663f362cfffc910e3094afc82bbbc7a0a92b0b6bdb";
+const P256_X: &[u8] = b"bfa7c08def823d8ef438d35e198b699dfa03db913db2cf82867d8ef13beb381b";
+
+pub const ECDH_VECTORS: &[EcdhVector] = &[
+    EcdhVector { name: "P-256", scalar: P256_D, public: P256_DG,
+                 peer: P256_PEER, shared_x: P256_X },
+];

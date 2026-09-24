@@ -14,7 +14,7 @@
 //! scalar multiplication needs no inversion until the very end.  Both curves
 //! have a = -3, which the doubling formula below relies on.
 
-use crate::crypto::bignum::{from_be_bytes, zero, Big, Modulus};
+use crate::crypto::bignum::{from_be_bytes, to_be_bytes, zero, Big, Modulus};
 use crate::crypto::sha512::{hash384, hash512};
 use crate::sha256::hash as hash256;
 
@@ -103,7 +103,7 @@ struct Jac {
 }
 
 /// A curve with its two modular contexts ready.
-pub struct Ecdsa {
+pub struct Ec {
     md: Modulus,
     order: Modulus,
     fn_limbs: usize,
@@ -121,7 +121,7 @@ pub struct Ecdsa {
     order_len: usize,
 }
 
-impl Ecdsa {
+impl Ec {
     pub fn new(c: &Curve) -> Option<Self> {
         let (p, pn) = from_be_bytes(c.p);
         let (n, nn) = from_be_bytes(c.n);
@@ -294,8 +294,7 @@ impl Ecdsa {
     /// root, which is more code for a form no certificate in the wild uses.
     /// The point is checked to be on the curve, which is what stops an
     /// invalid-curve attack.
-    pub fn point_from_bytes(&self, data: &[u8]) -> Option<Jac> {
-        if data.len() != 1 + 2 * self.coord_len || data[0] != 0x04 {
+    pub fn point_from_bytes(&self, data: &[u8]) -> Option<Jac> {        if data.len() != 1 + 2 * self.coord_len || data[0] != 0x04 {
             return None;
         }
         let (x, _) = from_be_bytes(&data[1..1 + self.coord_len]);
@@ -355,6 +354,69 @@ impl Ecdsa {
         };
         xr == rb
     }
+
+    // --- key agreement ------------------------------------------------------
+    //
+    // The same arithmetic the verifier uses, pointed the other way: TLS 1.2's
+    // ECDHE needs a key pair and a shared secret, and a server that will not
+    // do X25519 leaves this as the only way in.
+
+    /// The public key for a private scalar: k·G, in the uncompressed form a
+    /// key exchange puts on the wire.  Returns the length written.
+    pub fn public_from_scalar(&self, scalar: &[u8], out: &mut [u8]) -> Option<usize> {
+        let (k, _) = from_be_bytes(scalar);
+        if !self.scalar_ok(&k) {
+            return None;
+        }
+        let p = self.scalar_mul(&self.generator(), &k);
+        self.point_to_bytes(&p, out)
+    }
+
+    /// ECDH: the x-coordinate of k·Q, which is the shared secret both ends
+    /// derive the session keys from.  Returns its length.
+    ///
+    /// The peer's point is checked to be on the curve first.  That check is
+    /// the whole security of this operation: a point that lies on a different
+    /// curve with the same field and the same parameters gives up the private
+    /// scalar a few bits at a time, and every answer still looks like a
+    /// perfectly good shared secret.
+    pub fn shared_secret(&self, scalar: &[u8], peer: &[u8], out: &mut [u8]) -> Option<usize> {
+        let (k, _) = from_be_bytes(scalar);
+        if !self.scalar_ok(&k) {
+            return None;
+        }
+        let q = self.point_from_bytes(peer)?;
+        let p = self.scalar_mul(&q, &k);
+        let (x, _) = self.affine(&p)?;
+        let w = self.coord_len;
+        if out.len() < w {
+            return None;
+        }
+        let mut buf = [0u8; 64];
+        // `fn_limbs`, not `w`: the writer counts limbs, and passing a byte
+        // count asks it for eight times the bytes, which it then fills from
+        // limbs that do not exist — producing a zero secret that is the right
+        // shape and the wrong number.
+        to_be_bytes(&x, self.fn_limbs, &mut buf);
+        out[..w].copy_from_slice(&buf[..w]);
+        Some(w)
+    }
+
+    fn point_to_bytes(&self, p: &Jac, out: &mut [u8]) -> Option<usize> {
+        let (x, y) = self.affine(p)?;
+        let w = self.coord_len;
+        let n = 1 + 2 * w;
+        if out.len() < n {
+            return None;
+        }
+        out[0] = 0x04;
+        let mut buf = [0u8; 64];
+        to_be_bytes(&x, self.fn_limbs, &mut buf);
+        out[1..1 + w].copy_from_slice(&buf[..w]);
+        to_be_bytes(&y, self.fn_limbs, &mut buf);
+        out[1 + w..n].copy_from_slice(&buf[..w]);
+        Some(n)
+    }
 }
 
 /// Subtract two from a big-endian byte string, in place.
@@ -413,8 +475,8 @@ pub fn selftest() -> usize {
     use crate::crypto::ec_vectors::EC_VECTORS;
     let mut f = 0usize;
 
-    let p256 = Ecdsa::new(&P256);
-    let p384 = Ecdsa::new(&P384);
+    let p256 = Ec::new(&P256);
+    let p384 = Ec::new(&P384);
     let (Some(p256), Some(p384)) = (p256, p384) else {
         return check("ecdsa curve setup", &[], &[1]);
     };
@@ -466,5 +528,54 @@ pub fn selftest() -> usize {
         f += check("rejects a tampered signature", &[ok as u8], &[0]);
     }
 
+    // Key agreement, against values from OpenSSL.  Both halves are checked:
+    // the public key a scalar produces, and the secret it produces with a
+    // peer's point.  Checking only the second would pass a multiplication that
+    // is wrong the same way in both directions.
+    for v in crate::crypto::ec_vectors::ECDH_VECTORS {
+        let (Some((scalar, sn)), Some((pub_buf, pn)), Some((peer, qn)), Some((want_x, xn))) = (
+            hex_bytes(v.scalar),
+            hex_bytes(v.public),
+            hex_bytes(v.peer),
+            hex_bytes(v.shared_x),
+        ) else {
+            f += check("ecdh vectors decode", &[], &[1]);
+            continue;
+        };
+        // Sliced to the decoded length.  Handing the whole buffer to a
+        // big-endian reader appends 160 bytes of zero to every value, which
+        // shifts the scalar into a different number rather than failing.
+        let (scalar, want_pub, peer, want_x) =
+            (&scalar[..sn], &pub_buf[..pn], &peer[..qn], &want_x[..xn]);
+
+        let mut got = [0u8; 192];
+        let n = p256.public_from_scalar(scalar, &mut got).unwrap_or(0);
+        f += check("ecdh public key", &got[..n], want_pub);
+
+        let mut secret = [0u8; 64];
+        let n = p256.shared_secret(scalar, peer, &mut secret).unwrap_or(0);
+        f += check("ecdh shared secret", &secret[..n], want_x);
+
+        // A point that is not on the curve must be refused rather than used.
+        // This is the check that stands between the private scalar and an
+        // invalid-curve attack, and it is invisible when it is missing.
+        let mut off_curve = [0u8; 192];
+        off_curve[..qn].copy_from_slice(peer);
+        off_curve[qn - 1] ^= 0x01;
+        f += check("ecdh rejects a point off the curve",
+                   &[p256.shared_secret(scalar, &off_curve[..qn], &mut secret).is_none()
+                     as u8], &[1]);
+    }
+
     f
+}
+
+/// Decode a hex string into a buffer, with the number of bytes decoded.
+fn hex_bytes(hex: &[u8]) -> Option<([u8; 192], usize)> {
+    let mut b = [0u8; 192];
+    let n = crate::crypto::unhex(hex, &mut b);
+    if n == 0 {
+        return None;
+    }
+    Some((b, n))
 }
