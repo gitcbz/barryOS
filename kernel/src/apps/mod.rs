@@ -157,4 +157,18 @@ pub fn run_selftest() {
         terminal::process_command(cmd);
     }
     serial::print_str("[apps] terminal: all commands processed OK\n");
+
+    // The page renderer, over a document whose answer is known.  It is the
+    // only self-test that exercises four subsystems at once, and the only one
+    // whose failure would otherwise show up as a page that reads slightly
+    // wrong — which is not a thing anyone reports.
+    serial::print_str("[apps] step 5: page renderer self-test\n");
+    let failures = web::selftest();
+    if failures == 0 {
+        serial::print_str("[web] all checks pass\n");
+    } else {
+        serial::print_str("[web] ");
+        serial::print_dec(failures as u64);
+        serial::print_str(" check(s) FAILED\n");
+    }
 }

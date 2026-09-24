@@ -21,6 +21,134 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
+/// Run the whole engine over a page whose answer is known.
+///
+/// The pieces all have tests of their own — the parser on real markup, the
+/// cascade on real stylesheets, the interpreter against a page it builds
+/// itself — but none of those can say whether the four together turn a
+/// document into the lines a reader expects.  This can, and it runs at boot
+/// where a serial log captures it.
+///
+/// The page is written to exercise the things that go wrong quietly: a loop
+/// and `innerHTML`, an element built and appended, a class whose stylesheet
+/// says it should be different, a table, and a `<script>` whose *source* must
+/// not appear in the output.
+pub fn selftest() -> usize {
+    const PAGE: &str = r#"<!doctype html><html><head>
+<style>
+  .shout { color: #ff0000; font-weight: bold }
+  h1 { color: #0000ff }
+</style></head><body>
+<h1>Heading</h1>
+<div id="out"></div>
+<ul id="list"></ul>
+<table><tr><td>left</td><td>right</td></tr></table>
+<pre>  two
+  lines</pre>
+<script>
+  var s = 0;
+  for (var i = 1; i <= 10; i++) s += i;
+  document.getElementById('out').innerHTML = '<p>sum is ' + s + '</p>';
+  var names = ['alpha', 'beta'];
+  var ul = document.getElementById('list');
+  for (var j = 0; j < names.length; j++) {
+    var li = document.createElement('li');
+    li.textContent = names[j].toUpperCase();
+    li.className = 'shout';
+    ul.appendChild(li);
+  }
+  console.log('done');
+</script>
+</body></html>"#;
+
+    // Printed because a renderer that runs out of heap corrupts rather than
+    // fails: a slice with a garbage length is a wild pointer, not an error.
+    crate::serial::print_str("[web]   heap free ");
+    crate::serial::print_dec(crate::mem::heap::free() as u64);
+    crate::serial::print_str("
+");
+    let mark = crate::mem::heap::mark();
+    let mut failures = 0usize;
+    {
+        let page = Page::parse(PAGE.as_bytes());
+        let outcome = page.run_scripts("https://example.invalid/");
+        let has = |needle: &str, what: &str, failures: &mut usize| {
+            let lines = page.layout(72);
+            let text = lines
+                .iter()
+                .map(|l| l.text())
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            let ok = text.contains(needle);
+            crate::serial::print_str("[web]   ");
+            crate::serial::print_str(if ok { "ok   " } else { "FAIL " });
+            crate::serial::print_str(what);
+            if !ok {
+                crate::serial::print_str(" (no `");
+                crate::serial::print_str(needle);
+                crate::serial::print_str("`)");
+                *failures += 1;
+            }
+            crate::serial::print_str("\n");
+        };
+
+        has("sum is 55", "a loop and innerHTML", &mut failures);
+        has("ALPHA", "createElement, appendChild and toUpperCase", &mut failures);
+        has("BETA", "the second iteration", &mut failures);
+        has("Heading", "a heading", &mut failures);
+        has("left", "a table cell", &mut failures);
+        has("right", "the second column", &mut failures);
+        has("two", "the first line of a pre", &mut failures);
+
+        // The script's source must not be prose.  This is the one that decides
+        // whether the output is a page or a wall of JavaScript.
+        let lines = page.layout(72);
+        let text = lines.iter().map(|l| l.text()).collect::<alloc::vec::Vec<_>>().join("\n");
+        let mut f = 0usize;
+        if text.contains("var s = 0") {
+            crate::serial::print_str("[web]   FAIL script source in the output\n");
+            f += 1;
+        } else {
+            crate::serial::print_str("[web]   ok   script source is not prose\n");
+        }
+        failures += f;
+
+        // And the stylesheet must have reached a run: a `.shout` list item is
+        // bold, and nothing else on the page is.
+        let mut bold = false;
+        for line in page.layout(72).iter() {
+            for run in &line.runs {
+                if run.style.bold && run.text.contains("ALPHA") {
+                    bold = true;
+                }
+            }
+        }
+        crate::serial::print_str("[web]   ");
+        crate::serial::print_str(if bold { "ok   " } else { "FAIL " });
+        crate::serial::print_str("a class from the stylesheet reached a run\n");
+        if !bold {
+            failures += 1;
+        }
+
+        if outcome.ran == 0 {
+            crate::serial::print_str("[web]   FAIL the script did not run\n");
+            failures += 1;
+        }
+        if let Some(err) = &outcome.error {
+            crate::serial::print_str("[web]   FAIL script error: ");
+            crate::serial::print_str(err);
+            crate::serial::print_str("\n");
+            failures += 1;
+        }
+    }
+    // Before the heap goes: the interpreter keeps prototypes in statics and
+    // they are heap allocations like any other.
+    js::value::forget_prototypes();
+    js::domjs::forget();
+    unsafe { crate::mem::heap::reset_to(mark) };
+    failures
+}
+
 /// Everything one page needs, in the order a browser does it.
 ///
 /// The document is shared rather than owned, because a script has to be able

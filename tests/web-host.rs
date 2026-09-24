@@ -14,6 +14,25 @@
 
 extern crate alloc;
 
+/// The kernel's heap, as the page renderer uses it.  A real bump arena is not
+/// needed to find out whether the pipeline produces the right text, and the
+/// host allocator already frees properly — so these are markers.
+mod mem {
+    pub mod heap {
+        pub fn mark() -> usize { 0 }
+        pub unsafe fn reset_to(_m: usize) {}
+        pub fn used() -> usize { 0 }
+        pub fn free() -> usize { usize::MAX }
+    }
+}
+
+/// The kernel writes its log to COM1; here it goes to stdout.
+mod serial {
+    pub fn print_str(s: &str) { print!("{}", s); }
+    pub fn print_dec(v: u64) { print!("{}", v); }
+    pub fn print_hex(v: u64) { print!("{:x}", v); }
+}
+
 #[path = "../kernel/src/apps/web/mod.rs"]
 mod web;
 
@@ -104,6 +123,12 @@ const CASES: &[(&str, &str)] = &[
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if std::env::var("SELFTEST").is_ok() {
+        let n = web::selftest();
+        println!("
+{} failure(s)", n);
+        std::process::exit(if n == 0 { 0 } else { 1 });
+    }
     if args.is_empty() {
         for (name, html) in CASES {
             show(name, html);

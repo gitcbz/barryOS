@@ -314,6 +314,22 @@ pub fn set_type_prototypes(
     }
 }
 
+/// Drop everything this module keeps that lives on the heap.
+///
+/// The prototypes and the element hooks are held in statics so that a string
+/// literal has methods and an element has properties.  They are heap
+/// allocations, and `heap::reset_to` reclaims everything allocated since a
+/// mark without knowing whether anything still refers to it — so a reset that
+/// leaves these behind leaves the next property lookup reading freed memory,
+/// which is a wild pointer rather than an error.  Whoever resets the heap has
+/// to call this first.
+pub fn forget_prototypes() {
+    unsafe {
+        *core::ptr::addr_of_mut!(PROTOS) = None;
+        *core::ptr::addr_of_mut!(ELEMENT_HOOKS) = None;
+    }
+}
+
 fn type_proto(v: &Value) -> Option<Value> {
     let p = unsafe { core::ptr::addr_of!(PROTOS).as_ref() }?.as_ref()?;
     Some(match v {

@@ -169,6 +169,17 @@ fn root_of(dom: &Dom) -> usize {
 //  Installation
 // ---------------------------------------------------------------------------
 
+/// Drop the prototype and the host, for the same reason as
+/// `value::forget_prototypes`: both are heap allocations held in statics, and
+/// a heap reset cannot see them.
+pub fn forget() {
+    unsafe {
+        *core::ptr::addr_of_mut!(ELEMENT_PROTO) = None;
+        *core::ptr::addr_of_mut!(HOST) = None;
+    }
+}
+
+/// Install the DOM into an interpreter.
 pub fn install(it: &mut Interp) {
     value::set_element_hooks(element_get, element_set);
     let g = it.globals.clone();

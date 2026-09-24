@@ -152,6 +152,13 @@ fn go() {
         LINE_COUNT = 0;
         TOP = 0;
         CAPTURED = false;
+        PENDING_NAV = None;
+        PAGE_OBJ = None;
+        RES.active = false;
+        RES.count = 0;
+        RES.at = 0;
+        RES.sheet_count = 0;
+        RES.script_count = 0;
     }
     if !http::start(text) {
         serial::print_str("[browser] request refused at start\n");
@@ -354,25 +361,187 @@ fn url_str() -> &'static str {
 }
 static mut URL_VIEW: [u8; MAX_URL] = [0; MAX_URL];
 
-/// Turn the fetched body into displayable lines, with a style per byte.
-///
-/// The whole pipeline, in the order a browser runs it: parse the markup, apply
-/// the stylesheets, run the scripts — which may change the tree the layout is
-/// about to read — and lay the result out.  Then everything the pipeline
-/// allocated is handed back, because none of it outlives the copy into the
-/// line tables below and a browser that leaked a document per page would run
-/// out of heap on the fourth one.
-unsafe fn layout() {
-    let body = core::slice::from_raw_parts(core::ptr::addr_of!(PAGE) as *const u8, PAGE_LEN);
-    let url = url_str();
+// ---------------------------------------------------------------------------
+//  Subresources
+// ---------------------------------------------------------------------------
+//
+// A page is rarely one file.  Its stylesheets are `<link href>` and its
+// scripts are `<script src>`, and a browser that fetches only the HTML renders
+// the markup with no styling and no behaviour — which is the difference
+// between the feature working and appearing to.
+//
+// The HTTP client does one request at a time, so these are fetched in
+// sequence after the document and the layout waits for them.  Both lists are
+// bounded: a page that references two hundred scripts is a page whose scripts
+// would not run here anyway, and fetching them one at a time would take longer
+// than anyone would wait.
 
+const MAX_SUBS: usize = 10;
+const MAX_CSS: usize = 4;
+const MAX_JS: usize = 6;
+/// A subresource larger than this is not one: a stylesheet is tens of
+/// kilobytes and a script is often more, but not megabytes.
+const SUB_CAP: usize = 24 * 1024;
+
+struct Resources {
+    urls: [Option<String>; MAX_SUBS],
+    css: [bool; MAX_SUBS],
+    count: usize,
+    /// The next one to fetch; `count` when there are no more.
+    at: usize,
+    /// Set while a fetch is in flight.
+    active: bool,
+    sheets: [String; MAX_CSS],
+    sheet_count: usize,
+    scripts: [String; MAX_JS],
+    script_count: usize,
+}
+
+static mut RES: Resources = Resources {
+    urls: [None, None, None, None, None, None, None, None, None, None],
+    css: [false; MAX_SUBS],
+    count: 0,
+    at: 0,
+    active: false,
+    sheets: [const { String::new() }; MAX_CSS],
+    sheet_count: 0,
+    scripts: [const { String::new() }; MAX_JS],
+    script_count: 0,
+};
+
+/// A navigation a script asked for, or a meta refresh, to be taken once the
+/// layout is done.
+static mut PENDING_NAV: Option<String> = None;
+/// The parsed document, held across the subresource fetches because the layout
+/// needs it at the end of them.
+static mut PAGE_OBJ: Option<web::Page> = None;
+
+/// Turn a reference into something the HTTP client can fetch.
+///
+/// Three shapes, all of them common: a full URL, a root-relative path, and a
+/// path relative to the directory the page is in.  The last is the one that
+/// goes wrong quietly — `/assets/app.css` from `https://host/a/b/` is
+/// `https://host/assets/app.css`, not `https://host/a/b/assets/app.css`.
+pub fn resolve_url(base: &str, href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.is_empty() || href.starts_with('#') || href.starts_with("data:")
+        || href.starts_with("javascript:") || href.starts_with("mailto:")
+    {
+        return None;
+    }
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return Some(String::from(href));
+    }
+    let (scheme, rest) = match base.find("://") {
+        Some(i) => (&base[..i], &base[i + 3..]),
+        None => return None,
+    };
+    // A protocol-relative reference takes the page's scheme.
+    if let Some(host_path) = href.strip_prefix("//") {
+        return Some(alloc::format!("{}://{}", scheme, host_path));
+    }
+    let (host, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    if let Some(abs) = href.strip_prefix('/') {
+        return Some(alloc::format!("{}://{}/{}", scheme, host, abs));
+    }
+    let dir = match path.rfind('/') {
+        Some(i) => &path[..i + 1],
+        None => "/",
+    };
+    Some(alloc::format!("{}://{}{}{}", scheme, host, dir, href))
+}
+
+/// Where the page is, for resolving against.  The address bar may hold a bare
+/// host, which means https.
+fn base_url() -> String {
+    let raw = url_str();
+    if raw.contains("://") {
+        String::from(raw)
+    } else {
+        alloc::format!("https://{}/", raw.trim_end_matches('/'))
+    }
+}
+
+/// Copy the current body into a string, bounded.
+unsafe fn body_text(cap: usize) -> String {
+    let n = http::body_len().min(cap);
+    let mut out = String::with_capacity(n);
+    let mut at = 0usize;
+    while at < n {
+        let mut chunk = [0u8; 512];
+        let want = (n - at).min(512);
+        let r = http::read_body(at, &mut chunk);
+        if r == 0 {
+            break;
+        }
+        out.push_str(&String::from_utf8_lossy(&chunk[..r]));
+        at += r;
+    }
+    out
+}
+
+/// Start fetching the next thing the page referenced, if there is one.
+/// Returns false when there is nothing left to wait for.
+unsafe fn start_next_sub() -> bool {
+    let res = &mut *core::ptr::addr_of_mut!(RES);
+    while res.at < res.count {
+        let url = res.urls[res.at].clone();
+        res.at += 1;
+        let Some(url) = url else { continue };
+        serial::print_str("[browser] fetching ");
+        serial::print_str(&url);
+        serial::print_str("\n");
+        res.active = true;
+        http::start(&url);
+        return true;
+    }
+    res.active = false;
+    false
+}
+
+/// The subresource that was in flight has arrived.
+unsafe fn sub_arrived() {
+    let res = &mut *core::ptr::addr_of_mut!(RES);
+    res.active = false;
+    let is_css = res.css[res.at - 1];
+    let text = body_text(SUB_CAP);
+    // A stylesheet that 404s is the page's problem and not one this browser
+    // can fix, so an empty body is simply not added.
+    if !text.is_empty() {
+        if is_css {
+            if res.sheet_count < MAX_CSS {
+                res.sheets[res.sheet_count] = text;
+                res.sheet_count += 1;
+            }
+        } else if res.script_count < MAX_JS {
+            res.scripts[res.script_count] = text;
+            res.script_count += 1;
+        }
+    }
+    if !start_next_sub() {
+        finish();
+    }
+}
+
+/// Everything is in: apply the styles, run the scripts, lay the page out.
+unsafe fn finish() {
+    let slot = core::ptr::addr_of_mut!(PAGE_OBJ);
+    let Some(mut page) = (*slot).take() else { return };
+    let res = &mut *core::ptr::addr_of_mut!(RES);
+    for sheet in res.sheets.iter().take(res.sheet_count) {
+        page.css.push(sheet.clone());
+    }
+    for script in res.scripts.iter().take(res.script_count) {
+        page.scripts.push(script.clone());
+    }
+
+    let url = base_url();
     let mark = crate::mem::heap::mark();
     {
-        let mut page = web::Page::parse(body);
-        for css in FETCHED_CSS.iter().take(unsafe { CSS_COUNT }) {
-            page.css.push(css.clone());
-        }
-        let outcome = page.run_scripts(url);
+        let outcome = page.run_scripts(&url);
         if !outcome.log.is_empty() {
             serial::print_str("[browser] console: ");
             serial::print_str(&outcome.log);
@@ -385,66 +554,86 @@ unsafe fn layout() {
             serial::print_str(err);
             serial::print_str("\n");
         }
-        if let Some(target) = outcome.navigate {
-            PENDING_NAV = Some(target);
-        }
+        PENDING_NAV = outcome.navigate.or_else(|| page.meta_refresh());
 
         let lines = page.layout(COLS);
+        copy_lines(&lines);
+    }
+    // Everything the pipeline allocated, in one step — after dropping the
+    // two things that outlive it: the interpreter's prototypes and the DOM
+    // host, both held in statics and both heap allocations.  Anything else
+    // still reachable from here is a bug that would read as a wild pointer
+    // rather than as a use-after-free.
+    web::js::value::forget_prototypes();
+    web::js::domjs::forget();
+    crate::mem::heap::reset_to(mark);
 
-        let out = core::ptr::addr_of_mut!(TEXT) as *mut u8;
-        let at = core::ptr::addr_of_mut!(LINE_AT) as *mut u32;
-        let ln = core::ptr::addr_of_mut!(LINE_LEN) as *mut u32;
-        let st = core::ptr::addr_of_mut!(STYLE_AT) as *mut u8;
-        STYLE_N = 0;
-        intern(&web::css::Style::initial());
+    serial::print_str("[browser] laid out ");
+    serial::print_dec(LINE_COUNT as u64);
+    serial::print_str(" lines\n");
 
-        let mut n = 0usize;
-        let mut count = 0usize;
-        for line in lines.iter() {
-            if count >= MAX_LINES || n >= PAGE_CAP {
-                break;
-            }
-            let start = n;
-            for run in &line.runs {
-                let code = intern(&run.style);
-                for b in run.text.bytes() {
-                    if n >= PAGE_CAP {
-                        break;
-                    }
-                    core::ptr::write_volatile(out.add(n), b);
-                    core::ptr::write_volatile(st.add(n), code);
-                    n += 1;
-                }
-            }
-            if n > start {
-                core::ptr::write_volatile(at.add(count), start as u32);
-                core::ptr::write_volatile(ln.add(count), (n - start) as u32);
-                count += 1;
-            } else {
-                // A blank line is still a line: the blank ones are what
-                // separate a heading from what follows it.
-                core::ptr::write_volatile(at.add(count), n as u32);
-                core::ptr::write_volatile(ln.add(count), 0);
-                count += 1;
+    // A redirect the page asked for itself, with a script or a meta tag,
+    // rather than with a header.  baidu.com's https page is exactly this: a
+    // script that rewrites the scheme, and a meta refresh saying the same
+    // thing to anyone whose scripts did not run.
+    if let Some(target) = PENDING_NAV.take() {
+        if let Some(abs) = resolve_url(&url, &target) {
+            if abs != url {
+                serial::print_str("[browser] the page asked to go to ");
+                serial::print_str(&abs);
+                serial::print_str("\n");
+                set_url(&abs);
+                go();
             }
         }
-        LINE_COUNT = count;
-        TOP = 0;
     }
-    // Everything the pipeline allocated, in one step.  Nothing above is
-    // referenced from here on: what the renderer draws is the copy.
-    crate::mem::heap::reset_to(mark);
 }
 
-/// Stylesheets fetched for this page, and how many.
-static mut FETCHED_CSS: [String; 4] = [const { String::new() }; 4];
-static mut CSS_COUNT: usize = 0;
-/// A navigation a script asked for, to be taken once the layout is done.
-static mut PENDING_NAV: Option<String> = None;
+/// Copy laid-out lines into the flat buffers the renderer draws from.
+unsafe fn copy_lines(lines: &[web::layout::Line]) {
+    let out = core::ptr::addr_of_mut!(TEXT) as *mut u8;
+    let at = core::ptr::addr_of_mut!(LINE_AT) as *mut u32;
+    let ln = core::ptr::addr_of_mut!(LINE_LEN) as *mut u32;
+    let st = core::ptr::addr_of_mut!(STYLE_AT) as *mut u8;
+    STYLE_N = 0;
+    intern(&web::css::Style::initial());
+
+    let mut n = 0usize;
+    let mut count = 0usize;
+    for line in lines {
+        if count >= MAX_LINES || n >= PAGE_CAP {
+            break;
+        }
+        let start = n;
+        for run in &line.runs {
+            let code = intern(&run.style);
+            for b in run.text.bytes() {
+                if n >= PAGE_CAP {
+                    break;
+                }
+                core::ptr::write_volatile(out.add(n), b);
+                core::ptr::write_volatile(st.add(n), code);
+                n += 1;
+            }
+        }
+        // A blank line is still a line: the blank ones are what separate a
+        // heading from what follows it.
+        core::ptr::write_volatile(at.add(count), start as u32);
+        core::ptr::write_volatile(ln.add(count), (n - start) as u32);
+        count += 1;
+    }
+    LINE_COUNT = count;
+    TOP = 0;
+}
 
 /// Pull the body out of HTTP's receive buffer into ours, the first time the
-/// page is complete.
-fn capture() {
+/// page is complete, and work out what else it needs.
+///
+/// This is where a fetch becomes a page rather than a document: the markup is
+/// parsed, the stylesheets and scripts it names are queued, and the layout is
+/// held back until they have arrived.  Laying out first and styling later
+/// would show the page twice, once wrong.
+unsafe fn capture() {
     let n = http::body_len().min(PAGE_CAP);
     let base = core::ptr::addr_of_mut!(PAGE) as *mut u8;
     let mut got = 0usize;
@@ -456,42 +645,45 @@ fn capture() {
             break;
         }
         for (k, &b) in chunk[..r].iter().enumerate() {
-            unsafe { core::ptr::write_volatile(base.add(got + k), b) };
+            core::ptr::write_volatile(base.add(got + k), b);
         }
         got += r;
     }
-    unsafe {
-        PAGE_LEN = got;
-        layout();
-    }
-    serial::print_str("[browser] laid out ");
-    serial::print_dec(unsafe { LINE_COUNT } as u64);
-    serial::print_str(" lines from ");
-    serial::print_dec(got as u64);
-    serial::print_str(" bytes\n");
+    PAGE_LEN = got;
 
-    // Show the head of the result.  Everything above proves the network
-    // worked; this proves the markup stripper produced the page's prose
-    // rather than its tags, which is the part that goes wrong quietly.
-    unsafe {
-        let at = core::ptr::addr_of!(LINE_AT) as *const u32;
-        let ln = core::ptr::addr_of!(LINE_LEN) as *const u32;
-        let text = core::ptr::addr_of!(TEXT) as *const u8;
-        for i in 0..unsafe { LINE_COUNT }.min(3) {
-            let off = core::ptr::read_volatile(at.add(i)) as usize;
-            let len = core::ptr::read_volatile(ln.add(i)) as usize;
-            let mut buf = [0u8; 160];
-            let n = len.min(159);
-            for k in 0..n {
-                buf[k] = core::ptr::read_volatile(text.add(off + k));
-            }
-            if n == 0 {
-                continue;
-            }
-            serial::print_str("[browser]   | ");
-            serial::print_str(core::str::from_utf8(&buf[..n]).unwrap_or("?"));
-            serial::print_str("\n");
+    let page = web::Page::parse(core::slice::from_raw_parts(base, got));
+    let res = &mut *core::ptr::addr_of_mut!(RES);
+    res.count = 0;
+    res.at = 0;
+    res.sheet_count = 0;
+    res.script_count = 0;
+    res.active = false;
+    let base = base_url();
+    let mut queue = |href: &str, is_css: bool, res: &mut Resources| {
+        if res.count >= MAX_SUBS {
+            return;
         }
+        if let Some(url) = resolve_url(&base, href) {
+            res.urls[res.count] = Some(url);
+            res.css[res.count] = is_css;
+            res.count += 1;
+        }
+    };
+    for href in page.stylesheets.iter() {
+        queue(href, true, res);
+    }
+    for src in page.script_urls.iter() {
+        queue(src, false, res);
+    }
+    serial::print_str("[browser] ");
+    serial::print_dec(got as u64);
+    serial::print_str(" bytes of markup, ");
+    serial::print_dec(res.count as u64);
+    serial::print_str(" subresource(s)\n");
+
+    *core::ptr::addr_of_mut!(PAGE_OBJ) = Some(page);
+    if !start_next_sub() {
+        finish();
     }
 }
 
@@ -701,9 +893,15 @@ pub fn tick() -> bool {
         LAST_BODY = body;
     }
 
-    if http::phase() == http::Phase::Done && !unsafe { CAPTURED } {
-        unsafe { CAPTURED = true; }
-        capture();
+    if http::phase() == http::Phase::Done {
+        unsafe {
+            if RES.active {
+                sub_arrived();
+            } else if !CAPTURED {
+                CAPTURED = true;
+                capture();
+            }
+        }
     }
     true
 }

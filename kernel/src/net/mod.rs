@@ -292,6 +292,7 @@ fn selftest_https() {
         poll();
     }
     if http::phase() == http::Phase::Done {
+        selftest_render();
         serial::print_str("[net] self-test: https ok, status ");
         serial::print_dec(http::status_code() as u64);
         serial::print_str(", ");
@@ -307,6 +308,73 @@ fn selftest_https() {
         serial::print_str("\n");
     }
 }
+
+/// Run the page renderer over whatever was just fetched.
+///
+/// The whole path in one place at boot: the network, TLS, the HTML parser, the
+/// stylesheet engine, the interpreter and the layout.  Every one of those has
+/// its own tests, and none of them can say whether the six together produce a
+/// readable page — which is the only question that matters and the only one
+/// that needs a machine, a network and a log to answer.
+fn selftest_render() {
+    let n = http::body_len().min(RENDER_CAP);
+    if n == 0 {
+        return;
+    }
+    let mut body = alloc::vec::Vec::with_capacity(n);
+    let mut at = 0usize;
+    while at < n {
+        let mut chunk = [0u8; 512];
+        let want = (n - at).min(512);
+        let r = http::read_body(at, &mut chunk);
+        if r == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..r]);
+        at += r;
+    }
+
+    let mark = crate::mem::heap::mark();
+    {
+        let page = crate::apps::web::Page::parse(&body);
+        let outcome = page.run_scripts(SELFTEST_URL);
+        serial::print_str("[web] ");
+        serial::print_dec(page.dom.borrow().nodes.len() as u64);
+        serial::print_str(" nodes, ");
+        serial::print_dec(page.scripts.len() as u64);
+        serial::print_str(" inline script(s), ");
+        serial::print_dec(outcome.ran as u64);
+        serial::print_str(" ran");
+        if let Some(err) = &outcome.error {
+            serial::print_str(", stopped: ");
+            serial::print_str(err);
+        }
+        if !outcome.log.is_empty() {
+            serial::print_str(", console: ");
+            serial::print_str(outcome.log.trim_end());
+        }
+        serial::print_str("\n");
+
+        let lines = page.layout(76);
+        serial::print_str("[web] ");
+        serial::print_dec(lines.len() as u64);
+        serial::print_str(" lines laid out\n");
+        for line in lines.iter().filter(|l| !l.is_blank()).take(4) {
+            serial::print_str("[web]   | ");
+            serial::print_str(&line.text());
+            serial::print_str("\n");
+        }
+    }
+    // Safe here and only here: everything the pipeline built is dropped at the
+    // end of the block above, and what was copied out of it is a static.
+    crate::apps::web::js::value::forget_prototypes();
+    crate::apps::web::js::domjs::forget();
+    unsafe { crate::mem::heap::reset_to(mark) };
+}
+
+/// How much of a page the boot render test reads.  The browser keeps more;
+/// this only has to be enough to lay out a real page.
+const RENDER_CAP: usize = 48 * 1024;
 
 /// The name the boot self-test fetches.  Small, plain, and reliably there.
 /// It is a test target, not a "home page" — the browser's default is whatever

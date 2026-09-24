@@ -64,31 +64,15 @@ ISO         := $(BUILD)/barryOS.iso
 # Which certificate authorities the TLS client believes, generated from the
 # Mozilla bundle.  Defined here rather than beside its rule below, because a
 # `:=` variable expands where it is defined and the kernel rule needs to have
-# already seen it.  TRUST_ROOTS prunes the list: the full 121 roots are 42 KiB
-# of DER and the BIOS loader gives the kernel 572 KiB in total.  For a name to
-# survive pruning it has to be one that actually issues to the sites this
-# browser is expected to reach, or a root that several intermediates chain to.
-# Raise the ceiling in boot/bios/stage2.asm to carry the whole set.
+# already seen it.
+#
+# All of them.  This was a list of six, pruned by hand to stay inside the BIOS
+# loader's staging window, and a trust store chosen to fit a size budget is not
+# a trust store -- it is a list of the sites that happened to work.  The window
+# is no longer a constraint: the image is compressed before it is staged.
 CACERT        := $(BUILD)/cacert.pem
 TRUSTSTORE_RS := $(BUILD)/truststore.rs
-TRUST_ROOTS   ?= GlobalSign Root CA - R3,\
-                 GlobalSign Root CA - R6,\
-                 GlobalSign Root E46,\
-                 DigiCert Global Root G2,\
-                 DigiCert Global Root G3,\
-                 DigiCert Global Root CA,\
-                 ISRG Root X1,\
-                 ISRG Root X2,\
-                 USERTrust ECC,\
-                 USERTrust RSA,\
-                 GTS Root R1,\
-                 GTS Root R4,\
-                 SSL.com TLS ECC Root CA 2022,\
-                 Sectigo Public Server Authentication Root,\
-                 TrustAsia,\
-                 GlobalSign RSA OV SSL,\
-                 Certum Trusted Network CA 2,\
-                 COMODO Certification Authority
+TRUST_ROOTS   ?= all
 # The trust store generator parses certificates, so it needs the `cryptography`
 # package -- which the msys2 python does not have, and which is not needed for
 # anything else here.  Kept as its own variable rather than reusing PYTHON, so
