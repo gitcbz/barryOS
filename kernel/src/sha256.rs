@@ -31,6 +31,10 @@ const H0: [u32; 8] = [
 ];
 
 /// Streaming state, so a long input does not need one big buffer.
+///
+/// Cloneable, because TLS needs the transcript hash at several points during
+/// one handshake without giving up the running state.
+#[derive(Clone)]
 pub struct Sha256 {
     h: [u32; 8],
     buf: [u8; 64],
