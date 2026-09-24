@@ -41,6 +41,11 @@ KERN_PROFILE_FLAG := $(if $(filter release,$(PROFILE)),--release,)
 # outputs
 KERN_ELF    := $(BUILD)/kernel.elf
 KERN_BIN    := $(BUILD)/kernel.bin
+# The image the BIOS path reads.  The loader stages everything below 1 MiB
+# before moving it to 0x100000, and that window is 572 KiB and cannot grow, so
+# what goes on the disk is compressed and decompressed on the way up.  The
+# UEFI loader reads the file through EFI and uses the plain one.
+KERN_LZ     := $(BUILD)/kernel.lz
 MBR_BIN     := $(BUILD)/mbr.bin
 STAGE2_BIN  := $(BUILD)/stage2.bin
 # The boot chain, embedded into the kernel so the installer can write it to a
@@ -154,35 +159,45 @@ $(KERN_BIN): $(KERN_ELF)
 	# directory with non-ASCII characters in it fails to open the file, with an
 	# error that shows the name mangled past recognition.
 	cd $(ROOT) && $(OBJCOPY) -O binary build/kernel.elf build/kernel.bin
-	@sz=$$(stat -c%s $(KERN_BIN)); \
+	@echo "[kernel] $$(stat -c%s $(KERN_BIN)) bytes uncompressed"
+
+# LZ4 block format.  The encoder decodes its own output and compares before
+# writing, so a compressor bug fails the build rather than the boot.
+$(KERN_LZ): $(KERN_BIN) $(ROOT)/scripts/compress-kernel.py
+	cd $(ROOT) && $(PYTHON) scripts/compress-kernel.py build/kernel.bin build/kernel.lz
+	@sz=$$(stat -c%s $(KERN_LZ)); \
 	img_max=$$(( ($(BIOS_IMG_SECTORS) - $(KERNEL_IMG_LBA)) * 512 )); \
 	if [ $$sz -gt $(KERNEL_MAX_BYTES) ]; then \
-	  echo "[kernel] FATAL: kernel.bin is $$sz bytes, over the $(KERNEL_MAX_BYTES) byte ceiling"; \
-	  echo "[kernel] the BIOS loader stages the whole image below 1 MiB before"; \
-	  echo "[kernel] copying it to 0x100000, so the staging window is the limit"; \
-	  echo "[kernel] raise STAGING_LIMIT in boot/bios/stage2.asm and here together"; \
+	  echo "[kernel] FATAL: the compressed image is $$sz bytes, over the"; \
+	  echo "[kernel] $(KERNEL_MAX_BYTES) byte staging window the BIOS loader has."; \
+	  echo "[kernel] That window cannot grow: the BIOS writes to 16-bit"; \
+	  echo "[kernel] segment:offset addresses and video RAM starts above it."; \
 	  exit 1; \
 	fi; \
 	if [ $$sz -gt $$img_max ]; then \
-	  echo "[kernel] FATAL: kernel.bin is $$sz bytes, but the BIOS image only"; \
-	  echo "[kernel] has $$img_max bytes after LBA $(KERNEL_IMG_LBA)"; \
+	  echo "[kernel] FATAL: the compressed image is $$sz bytes, but the BIOS"; \
+	  echo "[kernel] image has only $$img_max bytes after LBA $(KERNEL_IMG_LBA)"; \
 	  echo "[kernel] raise BIOS_IMG_SECTORS in the Makefile"; \
 	  exit 1; \
-	fi; \
-	echo "[kernel] $$sz bytes = $$(( ($$sz + 511) / 512 )) sectors"
+	fi
 
 # ---------------------------------------------------------------------------
 #  BIOS boot chain
 # ---------------------------------------------------------------------------
 bios: $(BIOS_IMG)
 
+# `cd $(ROOT) &&` in front of every tool invocation, not just the ones with
+# several commands: make runs a single command line itself rather than through
+# a shell, and the PATH the toolchain lives on is exported to recipe *shells*.
+# Without the `cd` the assembler is looked for on the wrong PATH, or on a path
+# that does not exist because the tools are named by absolute msys paths.
 $(MBR_BIN): $(BOOT_DIR)/bios/mbr.asm
 	@mkdir -p $(BUILD)
-	$(NASM) -f bin $(BOOT_DIR)/bios/mbr.asm -o $(MBR_BIN)
+	cd $(ROOT) && $(NASM) -f bin boot/bios/mbr.asm -o build/mbr.bin
 
 $(STAGE2_BIN): $(BOOT_DIR)/bios/stage2.asm
 	@mkdir -p $(BUILD)
-	$(NASM) -f bin $(BOOT_DIR)/bios/stage2.asm -o $(STAGE2_BIN)
+	cd $(ROOT) && $(NASM) -f bin boot/bios/stage2.asm -o build/stage2.bin
 
 # Embed the boot chain — and the test program — into a Rust source file the
 # kernel includes.  rustc records included files in its dep-info, so cargo
@@ -219,19 +234,19 @@ truststore: $(TRUSTSTORE_RS)
 pe-check: $(TEST_EXE)
 	cd $(ROOT) && $(PYTHON) tests/pe-contract.py build/hello.exe kernel/src/compat/win32.rs
 
-$(BIOS_IMG): $(MBR_BIN) $(STAGE2_BIN) $(KERN_BIN)
+$(BIOS_IMG): $(MBR_BIN) $(STAGE2_BIN) $(KERN_LZ) $(KERN_BIN)
 	# Tell the loader how big the kernel is.  Written to a *copy*: stage2.bin
 	# itself is embedded in the kernel image, so patching it in place would
 	# change the embedded bytes every build and rebuild the kernel forever.
-	cd $(ROOT) && $(PYTHON) scripts/patch-stage2.py build/stage2.bin build/kernel.bin build/stage2.patched.bin
+	cd $(ROOT) && $(PYTHON) scripts/patch-stage2.py build/stage2.bin build/kernel.lz build/kernel.bin build/stage2.patched.bin
 	# create 4 MiB zeroed image
 	dd if=/dev/zero of=$(BIOS_IMG) bs=512 count=$(BIOS_IMG_SECTORS) status=none
 	# LBA 0: MBR
 	dd if=$(MBR_BIN) of=$(BIOS_IMG) conv=notrunc bs=512 count=1 status=none
 	# LBA 1..40: stage2 (20 KiB)
 	dd if=$(STAGE2_IMG) of=$(BIOS_IMG) conv=notrunc bs=512 seek=1 status=none
-	# LBA 41..: kernel  (must match KERNEL_DISK_LBA in stage2.asm)
-	dd if=$(KERN_BIN) of=$(BIOS_IMG) conv=notrunc bs=512 seek=41 status=none
+	# LBA 41..: the compressed kernel  (must match KERNEL_DISK_LBA in stage2.asm)
+	dd if=$(KERN_LZ) of=$(BIOS_IMG) conv=notrunc bs=512 seek=41 status=none
 	@echo "[bios] $(BIOS_IMG) ready"
 
 # ---------------------------------------------------------------------------

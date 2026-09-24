@@ -5,11 +5,11 @@
 ;  64-bit long mode and jump to the kernel flat binary at 0x00100000.
 ;
 ;  Flow:
-;    [16-bit]  load kernel.bin (LBA 41..) into conventional memory
+;    [16-bit]  stage the compressed kernel (LBA 41..) in conventional memory
 ;    [16-bit]  VBE: set a 32-bpp linear framebuffer, fill a BootInfo block
 ;    [16-bit]  enable A20 (fast 0x92, then kbd fallback)
 ;    [16-bit]  load 32-bit GDT, enter 32-bit protected mode
-;    [32-bit]  copy the staged kernel to 0x100000 (rep movsb)
+;    [32-bit]  decompress it to 0x100000 (LZ4 block)
 ;    [32-bit]  build identity page tables (first 256 MiB)
 ;    [32-bit]  enable PAE, set CR3, set EFER.LME, enable paging → long mode
 ;    [32-bit]  load 64-bit GDT, far-jmp to 64-bit code segment
@@ -24,10 +24,12 @@
 KERNEL_DISK_LBA    equ 41            ; kernel.bin starts at LBA 41
 KERNEL_FINAL       equ 0x00100000   ; kernel final physical address
 
-; The kernel is staged in conventional memory -- the BIOS can only write to a
-; 16-bit segment:offset -- and copied to KERNEL_FINAL by the single protected-
-; mode switch at the end of the load.  Everything from 0x10000 up to the EBDA
-; is ours to use, so the ceiling on the kernel image is KERNEL_STAGE_MAX.
+; The kernel's compressed image is staged in conventional memory -- the BIOS
+; can only write to a 16-bit segment:offset -- and decompressed to
+; KERNEL_FINAL by the single protected-mode switch at the end of the load.
+; Everything from 0x10000 up to the EBDA is ours to use, so the ceiling on the
+; image that is *staged* is KERNEL_STAGE_MAX.  That is why it is compressed:
+; the window cannot grow, and the kernel did.
 STAGING_SEG        equ 0x1000       ; staging area segment → linear 0x10000
 STAGING_OFF        equ 0x0000
 STAGING_LINEAR     equ 0x00010000
@@ -94,7 +96,10 @@ stage2_start:
     ; which frees the loader from a compile-time sector budget entirely.
     jmp short real_start
     times 2 db 0
-kernel_size_bytes: dd 0
+; The compressed image's length, and the length it should decompress to.
+; Both are patched in by scripts/patch-stage2.py.
+image_bytes: dd 0
+kernel_bytes: dd 0
 
 real_start:
     ; --- save boot drive ---
@@ -146,7 +151,7 @@ real_start:
     ;
     ; The price is a ceiling of KERNEL_STAGE_MAX instead of the 8 MiB the
     ; staging design was reaching for.
-    mov eax, [kernel_size_bytes]
+    mov eax, [image_bytes]
     test eax, eax
     jz no_size                          ; header not patched: refuse to guess
     cmp eax, KERNEL_STAGE_MAX
@@ -154,7 +159,7 @@ real_start:
 
     xor ebx, ebx
 .stream:
-    mov eax, [kernel_size_bytes]
+    mov eax, [image_bytes]
     cmp ebx, eax
     jae .done
 
@@ -793,7 +798,7 @@ msg_no_vbe:     db "[barryOS] no usable VBE mode, scanned 0x", 0
 ; Serial trace, so a headless boot leaves a record.
 msg_ser_enter:  db "[barryOS] stage2 entered, boot drive 0x", 0
 msg_ser_menu:   db "[barryOS] menu answer 0x", 0
-msg_ser_loaded: db "[barryOS] kernel streamed to 0x100000", 0
+msg_ser_loaded: db "[barryOS] compressed image staged below 1 MiB", 0
 msg_ser_vbe:    db "[barryOS] VBE mode 0x", 0
 msg_ser_novbe:  db "[barryOS] VBE failed, modes scanned 0x", 0
 
@@ -868,12 +873,69 @@ pm_entry:
 
     SER_BYTE 'P'                       ; reached 32-bit protected mode
 
-    ; The kernel is staged below 1 MiB; this is the one trip it takes to its
-    ; final home, and there is no way back to real mode afterwards.
+    ; The kernel sits compressed in the staging buffer below 1 MiB and this
+    ; is the one trip it takes to its final home.  It is decompressed rather
+    ; than copied because the staging window -- 0x10000 to the start of video
+    ; RAM -- is 572 KiB, which the kernel has outgrown and which cannot be
+    ; made bigger: the BIOS can only be asked to write to a 16-bit
+    ; segment:offset, so nothing larger can be read in the first place.
+    ; Reading it in pieces and copying each one up means switching back to
+    ; real mode between pieces, which an earlier version of this loader tried
+    ; and did not survive.
+    ;
+    ; LZ4 block format: a token byte, a literal run, a two-byte offset back
+    ; into what has already been written, and a match length, with the two
+    ; lengths extended by a run of 255s.  About forty instructions, no bit
+    ; reader and no dictionary.
     mov esi, STAGING_LINEAR
     mov edi, KERNEL_FINAL
-    mov ecx, [kernel_size_bytes]
-    rep movsb
+.sequence:
+    movzx eax, byte [esi]
+    inc esi
+    mov ebx, eax                    ; the token, for the match nibble
+    shr eax, 4                      ; literal length
+    cmp eax, 15
+    jne .lit_ok
+    call read_extended
+.lit_ok:
+    mov ecx, eax
+    rep movsb                       ; the literals
+    mov edx, STAGING_LINEAR
+    add edx, [image_bytes]
+    cmp esi, edx
+    jae .decoded                    ; a block ends with literals and no match
+    movzx edx, word [esi]           ; offset back into the output
+    add esi, 2
+    mov eax, ebx
+    and eax, 15
+    add eax, 4                      ; a match is at least four bytes
+    cmp eax, 19
+    jne .match_ok
+    call read_extended
+.match_ok:
+    mov ecx, eax
+    mov ebp, edi
+    sub ebp, edx                    ; the match may overlap what it copies,
+.match:                             ; which is why this is a byte at a time
+    mov al, [ebp]
+    mov [edi], al
+    inc ebp
+    inc edi
+    dec ecx
+    jnz .match
+    mov edx, STAGING_LINEAR
+    add edx, [image_bytes]
+    cmp esi, edx
+    jb .sequence
+.decoded:
+    ; A short output means the stream was not what it claimed, and jumping
+    ; into it would run whatever those bytes happen to be.  Thirty-two bytes
+    ; of leeway for an image whose length is not a multiple of four.
+    mov eax, edi
+    sub eax, KERNEL_FINAL
+    add eax, 32
+    cmp eax, [kernel_bytes]
+    jb decode_short
 
     SER_BYTE 'K'                       ; kernel image is at KERNEL_FINAL
 
@@ -923,10 +985,53 @@ pm_entry:
     mov eax, cr0
     or  eax, 0x80000000
     mov cr0, eax
-
     ; --- load 64-bit GDT, far-jmp to 64-bit code segment ---
     lgdt [gdt64_desc]
     jmp 0x08:lm_entry
+
+; These sit after an unconditional jump on purpose.  Placed among the
+; instructions above they would be fallen into, and the `ret` at the end of
+; the first would pop whatever the page-table setup had left on the stack.
+
+; eax += a run of 255s and the byte that ends it.  Used for both lengths,
+; and it lives here because only the decompressor calls it.
+read_extended:
+    push ecx
+.next:
+    movzx ecx, byte [esi]
+    inc esi
+    add eax, ecx
+    cmp ecx, 255
+    je .next
+    pop ecx
+    ret
+
+decode_short:
+    ; Say how much was decoded: a stream that stops early and a stream that
+    ; decodes to nothing need different fixes, and the number says which.
+    SER_BYTE 'S'
+    mov ecx, 8
+.hex:
+    rol eax, 4
+    push eax
+    push ecx
+    and al, 0x0F
+    cmp al, 10
+    jb .dec
+    add al, 'A' - 10
+    jmp .emit
+.dec:
+    add al, '0'
+.emit:
+    SER_BYTE al
+    pop ecx
+    pop eax
+    dec ecx
+    jnz .hex
+    SER_BYTE 10
+.hang: hlt
+    jmp .hang
+
 
 ; =============================================================================
 ;  64-bit long mode entry
