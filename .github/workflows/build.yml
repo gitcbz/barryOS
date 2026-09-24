@@ -37,12 +37,16 @@ jobs:
             nasm xorriso mtools dosfstools qemu-utils \
             clang lld binutils-mingw-w64-x86-64 gcc-mingw-w64-x86-64 \
             python3 file xxd
+          # The trust store generator parses certificates, so it needs
+          # `cryptography`; nothing else in the build uses Python packages.
+          python3 -m pip install --user --break-system-packages cryptography
           nasm -v
           xorriso --version | head -1
           qemu-img --version | head -1
           clang --version | head -1
           x86_64-w64-mingw32-ld --version | head -1
           x86_64-w64-mingw32-gcc --version | head -1
+          python3 -c "import cryptography; print(cryptography.__version__)"
 
       - name: Install Rust nightly
         run: |
