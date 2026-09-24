@@ -9,9 +9,38 @@ Last reconciled against the code: 2026-09-22.
 
 ## Recently completed
 
+### The page renderer
+- [x] **HTML5 parser** (`apps/web/dom.rs`) — implicit `html`/`head`/`body`,
+  the auto-closing rules, void elements, raw-text elements, character
+  references.  Not the specification's algorithm: no foster parenting and no
+  adoption agency, both of which real pages rarely exercise.
+- [x] **CSS engine** (`apps/web/css.rs`) — selectors, the cascade in the
+  specification's order, inheritance, and about thirty properties.
+- [x] **Layout** (`apps/web/layout.rs`) — blocks, inline flow with word
+  wrapping, real table columns, list markers, `<pre>`.  A text renderer:
+  pixels become whole character cells because half a cell does not exist.
+  No floats, no absolute positioning, no flex or grid.
+- [x] **JavaScript** (`apps/web/js/`) — lexer, parser and tree-walking
+  interpreter; strings, arrays, `Math`, `JSON`, and enough DOM to build
+  content (`createElement`, `appendChild`, `innerHTML`, `classList`, styles).
+  Not supported: classes, modules, promises, regular expressions, `Date`.
+  A script that uses those fails and says so; the page's `<noscript>` content
+  is what renders, which is why `<noscript>` is deliberately shown.
+- [x] **Verified** by `tests/run-web-host.sh`, which runs the kernel's own
+  sources over real pages on the host, and by a boot self-test with a known
+  answer that runs in the kernel.
+
 Kept here so the delta is visible; older rounds are in CHANGELOG.md.
 
 ### Boot chain
+- [x] **The kernel is compressed before it is staged.**  The BIOS loader can
+  only ask the BIOS to write to a 16-bit segment:offset, so the whole image had
+  to be staged below 1 MiB — 572 KiB, which cannot grow because video RAM
+  starts above it.  The kernel reached 587 KiB and stopped linking.  It is now
+  staged as an LZ4 block (366 KiB of 572) and decompressed to 0x100000 in the
+  one protected-mode switch.  The encoder decodes its own output and compares
+  before writing, so a compressor bug fails the build and not the boot.
+  **This is what made the full trust store possible.**
 - [x] **BIOS VBE mode setup** — stage2 never called `int 10h`. It passed `RDI=0` and
   the kernel fell back to a hardcoded `0xE0000000`, which is QEMU's Bochs VBE
   address and means nothing under VMware. stage2 now queries `4F00`/`4F01`/`4F02`
@@ -155,8 +184,24 @@ Kept here so the delta is visible; older rounds are in CHANGELOG.md.
 - [ ] **TCP is one connection at a time** — a second concurrent fetch has to
   wait. Fine for a browser doing one request per page; not fine for anything
   that fetches a page and its images, or opens two tabs.
-- [ ] **No `https`** — the browser says so rather than silently trying port 80.
-  TLS is a much larger piece of work than everything above it put together.
+- [x] **HTTPS** — TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246), client side, in
+  `crypto/`.  Both are checked against published vectors and against real
+  servers: `tests/run-tls-host.sh` compiles the kernel's own sources for the
+  host and runs handshakes against the internet in seconds, which is the only
+  way any of this was findable.  Verified end to end in the VM against
+  example.com, www.bilibili.com, www.deepseek.com (1.3) and www.baidu.com
+  (1.2 — it refuses 1.3 outright, and refuses X25519, so P-256 ECDHE exists
+  for it).
+- [ ] **TLS 1.1 is not implemented, deliberately.** Its PRF is MD5 and SHA-1,
+  neither of which is here, and RFC 8996 deprecated 1.0 and 1.1 in 2021 —
+  no public server negotiates it, so the code could never be run against a
+  real peer.
+- [ ] **No session resumption, no client certificates, no OCSP or CRL** — a
+  revoked certificate is accepted until it expires.
+- [ ] **The trust store is the whole Mozilla bundle** (121 roots, 55 KiB of
+  DER).  It was six hand-picked roots until the loader stopped being the
+  limit, which is worth recording: a trust store chosen to fit a size budget
+  is not a trust store.
 - [ ] **No reassembly or congestion control** — no out-of-order queue (a late
   segment costs a retransmission), no send window larger than one segment, no
   slow start.
@@ -191,9 +236,15 @@ Kept here so the delta is visible; older rounds are in CHANGELOG.md.
 
 ### P1 — usability
 
-- [ ] **Free-list heap allocator** (`mem/heap.rs`). `dealloc` is a no-op, so
-  `Vec` growth fails; heap test 3 is skipped. The RAM filesystem got a free list
-  for its data pool; the kernel heap has not.
+- [ ] **Free-list heap allocator** (`mem/heap.rs`). `dealloc` is still a no-op,
+  so anything that allocates and frees in a loop grows without bound; the heap
+  is 8 MiB and `mark`/`reset_to` reclaim everything since a point, which is
+  enough for a browser that parses a page and throws the tree away. It is not
+  enough for anything long-lived. Note that `reset_to` is `unsafe` for a real
+  reason: modules keep heap allocations in statics (`js::value::forget_prototypes`,
+  `js::domjs::forget`) and a reset that does not drop them leaves the next
+  lookup reading freed memory — which showed up as a general protection fault
+  in `memcmp`.
 - [ ] **Block device + a disk filesystem** — ATA-PIO or AHCI, then FAT32 or
   something of our own. Everything currently lives in RAM and vanishes on reset.
 - [ ] **`check.sh` is not a test suite.** ~50 of its ~64 checks grep the serial
@@ -214,10 +265,10 @@ Kept here so the delta is visible; older rounds are in CHANGELOG.md.
 - [ ] **Widget toolkit** — buttons and a dock exist as ad-hoc drawing, not as a
   reusable control library. No menus, scrollbars, list views or text fields.
 - [ ] **Screenshot tool and image viewer** (planned in ARCHITECTURE.md).
-- [ ] **Browser: no links, no history, no images** — it fetches one page and
-  shows its text.  Following a link means retyping the address, there is no
-  back button, and inline images are skipped entirely rather than shown as
-  placeholders.
+- [ ] **Browser: no links, no history, no images** — the renderer now knows
+  which line a link is on (see `layout::Line::link`) but nothing draws it as
+  clickable, there is no back button, and an `<img>` shows its `alt` text
+  rather than a picture.  No image decoder exists.
 - [ ] **Script arguments** — `run script a b` does not pass `$1`/`$2` through.
 - [ ] **`su` has no logout / no session lock**, and there is no way to change a
   password.
