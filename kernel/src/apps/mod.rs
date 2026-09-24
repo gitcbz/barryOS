@@ -15,6 +15,7 @@ pub mod filemgr;
 pub mod sysinfo;
 pub mod editor;
 pub mod installer;
+pub mod browser;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use crate::serial;
@@ -22,7 +23,7 @@ use crate::serial;
 pub static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Number of apps in the registry.
-pub const COUNT: usize = 4;
+pub const COUNT: usize = 5;
 
 /// Display name of registry entry `i`.
 pub fn name(i: usize) -> &'static str {
@@ -31,6 +32,7 @@ pub fn name(i: usize) -> &'static str {
         1 => "Files",
         2 => "System Info",
         3 => "Editor",
+        4 => "Browser",
         _ => "?",
     }
 }
@@ -42,6 +44,7 @@ pub fn launch(i: usize) {
         1 => filemgr::open(),
         2 => sysinfo::open(),
         3 => editor::open(),
+        4 => browser::open(),
         _ => {}
     }
 }
@@ -65,8 +68,38 @@ pub fn init() {
     serial::print_str("[apps] step 3: init system info\n");
     sysinfo::init();
 
+    serial::print_str("[apps] step 4: init browser\n");
+    browser::init();
+    load_home_page();
+
     INITIALIZED.store(true, Ordering::Release);
     serial::print_str("[apps] desktop applications online\n");
+}
+
+/// Fetch the browser's home page during boot.
+///
+/// A fetch only advances when somebody calls `net::poll`, and the loop that
+/// does that does not start until after the login screen — which waits for a
+/// human.  Left to the input loop, the browser would sit on "Loading..." for
+/// as long as nobody typed a password.  Pumping it here means the first
+/// composite already shows a page, and the boot log says whether the top half
+/// of the network stack — TCP, HTTP and the markup-to-lines pass — came out
+/// right.
+fn load_home_page() {
+    if !crate::net::configured() {
+        return;
+    }
+    browser::open_with(browser::HOME);
+    // Bounded by a deadline of our own, so a machine with no route out loses a
+    // couple of seconds and then carries on with an empty window.
+    let start = crate::interrupts::TIMER_TICKS.load(Ordering::Relaxed);
+    while crate::net::http::in_progress()
+        && crate::interrupts::TIMER_TICKS.load(Ordering::Relaxed)
+            .saturating_sub(start) < 2500
+    {
+        crate::net::poll();
+        browser::tick();
+    }
 }
 
 /// Draw the content of the window with this id.
@@ -85,6 +118,8 @@ pub fn render_content(win_id: u64) {
         editor::render();
     } else if win_id == installer::window_id() {
         installer::render();
+    } else if win_id == browser::window_id() {
+        browser::render();
     }
 }
 
@@ -99,6 +134,9 @@ pub fn on_click(win_id: u64, px: u32, py: u32) -> bool {
     if win_id == installer::window_id() {
         return installer::on_click(px, py);
     }
+    if win_id == browser::window_id() {
+        return browser::on_click(px, py);
+    }
     false
 }
 
@@ -108,7 +146,11 @@ pub fn on_click(win_id: u64, px: u32, py: u32) -> bool {
 /// a disk in PIO mode — runs here, between frames, so the progress bar it
 /// painted is on screen before the first write starts.
 pub fn tick() -> bool {
-    installer::tick()
+    // Both, not either: `||` would skip the browser on every pass where the
+    // installer happened to want a repaint, or the other way round.
+    let a = installer::tick();
+    let b = browser::tick();
+    a || b
 }
 
 /// Route a keystroke to the app that owns the focused window.
@@ -122,6 +164,9 @@ pub fn handle_key(win_id: u64, key: u8) -> bool {
     }
     if win_id == editor::window_id() {
         return editor::handle_key(key);
+    }
+    if win_id == browser::window_id() {
+        return browser::handle_key(key);
     }
     false
 }

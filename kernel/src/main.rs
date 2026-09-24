@@ -127,6 +127,7 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
 
     wm::boot::stage(5, "Probing the network...");
     net::init();
+    net::settle();
 
     wm::boot::stage(6, "Loading compatibility layers...");
     compat::init();

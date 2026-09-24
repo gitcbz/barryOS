@@ -488,6 +488,10 @@ pub fn process_command(cmd: &str) {
         "vmx" => cmd_vmx(cmd),
         "ip" => cmd_ip(arg(cmd, 1)),
         "arp" => cmd_arp(arg(cmd, 1)),
+        "ping" => cmd_ping(arg(cmd, 1)),
+        "dns" => cmd_dns(arg(cmd, 1)),
+        "http" => cmd_http(cmd.get(5..).unwrap_or("").trim_start()),
+        "browse" => crate::apps::browser::open(),
         "clear" => clear_buffer(),
         "" => {}
         _ => {
@@ -524,6 +528,12 @@ fn cmd_help() {
         "  chown <user> <path>",
         "system",
         "  ver  mem  ps  net  ip  arp  clear",
+        "network",
+        "  ip            address, mask, gateway, dns, dhcp state",
+        "  ping <host>   three ICMP echoes",
+        "  dns <name>    resolve a name",
+        "  http <url>    fetch a page and show its head",
+        "  browse [url]  open the browser window",
         "storage",
         "  df            filesystem and disks",
         "  sync          write the filesystem to disk",
@@ -1279,6 +1289,25 @@ fn cmd_net() {
 }
 
 fn cmd_ip(arg: &str) {
+    if arg.is_empty() {
+        // No argument: report rather than guess.  Every one of these came
+        // from DHCP, so printing them is how you tell a lease from a fallback.
+        put_str("address  ", PAL_GREY);
+        print_ip(crate::net::ipv4::our_ip());
+        newline();
+        put_str("mask     ", PAL_GREY);
+        print_ip(crate::net::ipv4::mask());
+        newline();
+        put_str("gateway  ", PAL_GREY);
+        print_ip(crate::net::ipv4::gateway());
+        newline();
+        put_str("dns      ", PAL_GREY);
+        print_ip(crate::net::dns::server());
+        newline();
+        put_str("dhcp     ", PAL_GREY);
+        put_line(crate::net::dhcp::status_str(), PAL_WHITE);
+        return;
+    }
     match crate::net::arp::parse_ip(arg) {
         Some(ip) => {
             crate::net::arp::set_our_ip(ip);
@@ -1286,8 +1315,172 @@ fn cmd_ip(arg: &str) {
             print_ip(ip);
             newline();
         }
-        None => err("usage: ip a.b.c.d"),
+        None => err("usage: ip [a.b.c.d]"),
     }
+}
+
+// ---------------------------------------------------------------------------
+//  Network
+// ---------------------------------------------------------------------------
+
+fn now_ticks() -> u64 {
+    crate::interrupts::TIMER_TICKS.load(Ordering::Relaxed)
+}
+
+/// Drive the stack for `ticks` PIT ticks.
+///
+/// There is no preemption and no network thread: the only thing that moves a
+/// packet is `net::poll`, so anything that waits for a reply waits by calling
+/// it.  The compositor stops for the duration, which is why every use of this
+/// is bounded by a small number of ticks.
+fn net_wait(ticks: u64) {
+    let start = now_ticks();
+    while now_ticks().saturating_sub(start) < ticks {
+        crate::net::poll();
+    }
+}
+
+/// Parse an address, or resolve a name if it is not one.
+fn resolve(target: &str) -> Option<[u8; 4]> {
+    if let Some(ip) = crate::net::arp::parse_ip(target) {
+        return Some(ip);
+    }
+    if crate::net::dns::server() == [0, 0, 0, 0] {
+        err("no DNS server (DHCP did not hand one out)");
+        return None;
+    }
+    put_str("resolving ", PAL_GREY);
+    put_line(target, PAL_GREY);
+    if !crate::net::dns::start(target) {
+        err("dns: could not send the query");
+        return None;
+    }
+    let start = now_ticks();
+    while crate::net::dns::state() == 1 && now_ticks().saturating_sub(start) < 600 {
+        crate::net::poll();
+    }
+    match crate::net::dns::take_result() {
+        Some(ip) => Some(ip),
+        None => {
+            err("dns: no answer");
+            None
+        }
+    }
+}
+
+fn cmd_dns(arg: &str) {
+    if arg.is_empty() {
+        err("usage: dns <name>");
+        return;
+    }
+    match resolve(arg) {
+        Some(ip) => {
+            put_str(arg, PAL_WHITE);
+            put_str("  ", PAL_GREY);
+            print_ip(ip);
+            newline();
+        }
+        None => {}
+    }
+}
+
+fn cmd_ping(arg: &str) {
+    if arg.is_empty() {
+        err("usage: ping <host|a.b.c.d>");
+        return;
+    }
+    let Some(ip) = resolve(arg) else { return };
+
+    put_str("PING ", PAL_GREY);
+    put_line(arg, PAL_WHITE);
+    let mut replies = 0u32;
+    for seq in 1..=3u16 {
+        let mut reply = None;
+        // The first packet to a new destination cannot go out until ARP has
+        // answered, so an attempt that fails to send is retried rather than
+        // counted as a lost packet.
+        for _ in 0..4 {
+            if crate::net::icmp::request(ip, seq) {
+                let start = now_ticks();
+                while now_ticks().saturating_sub(start) < 100 {
+                    crate::net::poll();
+                    if let Some(r) = crate::net::icmp::take_reply() {
+                        reply = Some(r);
+                        break;
+                    }
+                }
+                if reply.is_some() {
+                    break;
+                }
+            } else {
+                net_wait(20);                   // ARP in flight
+            }
+        }
+        put_str("  seq ", PAL_GREY);
+        print_dec(seq as u64);
+        put_str("  ", PAL_GREY);
+        match reply {
+            Some((from, rtt)) => {
+                replies += 1;
+                print_ip(from);
+                put_str("  ", PAL_GREY);
+                print_dec(rtt as u64);
+                put_line(" ms", PAL_WHITE);
+            }
+            None => put_line("no reply", PAL_RED),
+        }
+    }
+    put_str("3 packets transmitted, ", PAL_GREY);
+    print_dec(replies as u64);
+    put_line(" received", PAL_GREY);
+}
+
+fn cmd_http(url: &str) {
+    use crate::net::http;
+    if url.is_empty() {
+        err("usage: http <host[/path]>");
+        return;
+    }
+    put_str("GET ", PAL_GREY);
+    put_line(url, PAL_WHITE);
+    if !http::start(url) {
+        err(http::error());
+        return;
+    }
+    let start = now_ticks();
+    while http::in_progress() {
+        crate::net::poll();
+        if now_ticks().saturating_sub(start) > 3000 {
+            err("gave up waiting (30 s)");
+            return;
+        }
+    }
+    if http::phase() != http::Phase::Done {
+        err(http::error());
+        return;
+    }
+
+    put_str("status ", PAL_GREY);
+    print_dec(http::status_code() as u64);
+    if http::is_redirect() {
+        put_str("  (redirect)", PAL_YELLOW);
+    }
+    newline();
+    put_str("body ", PAL_GREY);
+    print_dec(http::body_len() as u64);
+    put_line(" bytes", PAL_GREY);
+
+    // Show the head of it.  The terminal buffer is 118 columns by 40 rows and
+    // already full of the session, so this is a taste, not a viewer — the
+    // browser window is the thing that displays a page.
+    let mut buf = [0u8; 1024];
+    let n = http::read_body(0, &mut buf);
+    let shown = n.min(600);
+    put_line("--- body ---", PAL_BLUE);
+    for line in core::str::from_utf8(&buf[..shown]).unwrap_or("").lines().take(12) {
+        put_line(line, PAL_WHITE);
+    }
+    put_line("--- end ---", PAL_BLUE);
 }
 
 fn cmd_arp(arg: &str) {
