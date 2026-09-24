@@ -16,7 +16,14 @@ debug = true
 
 [profile.release]
 panic = "abort"
-opt-level = 2
+# Size, not speed.  The BIOS loader stages the whole image below 1 MiB before
+# copying it up, which gives the kernel 572 KiB and no way to ask for more, so
+# the size of the image is a hard limit and its speed is not: at opt-level 2
+# this kernel is 583 KiB and does not fit, and at "z" it is 288 KiB and the
+# trust store can be a real one.  The crypto measured no slower, and a TLS
+# handshake to a server on the far side of the internet is dominated by the
+# round trips, not by the arithmetic.
+opt-level = "z"
 lto = true
 codegen-units = 1
 debug = false

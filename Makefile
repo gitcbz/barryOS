@@ -59,12 +59,31 @@ ISO         := $(BUILD)/barryOS.iso
 # Which certificate authorities the TLS client believes, generated from the
 # Mozilla bundle.  Defined here rather than beside its rule below, because a
 # `:=` variable expands where it is defined and the kernel rule needs to have
-# already seen it.  TRUST_ROOTS prunes the list: the full 121 roots are 85 KiB
-# of source and the BIOS loader gives the kernel 572 KiB in total.  Raise it
-# once the loader can stage more.
+# already seen it.  TRUST_ROOTS prunes the list: the full 121 roots are 42 KiB
+# of DER and the BIOS loader gives the kernel 572 KiB in total.  For a name to
+# survive pruning it has to be one that actually issues to the sites this
+# browser is expected to reach, or a root that several intermediates chain to.
+# Raise the ceiling in boot/bios/stage2.asm to carry the whole set.
 CACERT        := $(BUILD)/cacert.pem
 TRUSTSTORE_RS := $(BUILD)/truststore.rs
-TRUST_ROOTS   ?= SSL.com TLS ECC Root CA 2022,ISRG Root X1,DigiCert Global Root G2,GTS Root R1,USERTrust ECC,USERTrust RSA
+TRUST_ROOTS   ?= GlobalSign Root CA - R3,\
+                 GlobalSign Root CA - R6,\
+                 GlobalSign Root E46,\
+                 DigiCert Global Root G2,\
+                 DigiCert Global Root G3,\
+                 DigiCert Global Root CA,\
+                 ISRG Root X1,\
+                 ISRG Root X2,\
+                 USERTrust ECC,\
+                 USERTrust RSA,\
+                 GTS Root R1,\
+                 GTS Root R4,\
+                 SSL.com TLS ECC Root CA 2022,\
+                 Sectigo Public Server Authentication Root,\
+                 TrustAsia,\
+                 GlobalSign RSA OV SSL,\
+                 Certum Trusted Network CA 2,\
+                 COMODO Certification Authority
 # The trust store generator parses certificates, so it needs the `cryptography`
 # package -- which the msys2 python does not have, and which is not needed for
 # anything else here.  Kept as its own variable rather than reusing PYTHON, so
@@ -130,7 +149,11 @@ $(KERN_ELF): $(shell find $(KERN_DIR)/src -name '*.rs') $(KERN_DIR)/Cargo.toml $
 	@cp $(KERN_DIR)/target/$(TARGET)/$(PROFILE)/barryos-kernel $(KERN_ELF)
 
 $(KERN_BIN): $(KERN_ELF)
-	$(OBJCOPY) -O binary $(KERN_ELF) $(KERN_BIN)
+	# Relative paths, and `cd` first, for the same reason the EFI recipe below
+	# uses them: a native Windows binutils handed an absolute path under a
+	# directory with non-ASCII characters in it fails to open the file, with an
+	# error that shows the name mangled past recognition.
+	cd $(ROOT) && $(OBJCOPY) -O binary build/kernel.elf build/kernel.bin
 	@sz=$$(stat -c%s $(KERN_BIN)); \
 	img_max=$$(( ($(BIOS_IMG_SECTORS) - $(KERNEL_IMG_LBA)) * 512 )); \
 	if [ $$sz -gt $(KERNEL_MAX_BYTES) ]; then \
@@ -264,17 +287,23 @@ $(ISO): $(BIOS_IMG) $(UEFI_IMG)
 # ---------------------------------------------------------------------------
 #  VMDKs
 # ---------------------------------------------------------------------------
-# Self-contained virtual disks (monolithicSparse), for attaching to a VM
-# directly.  Kept out of `all` because it needs qemu-img, which is not part of
-# the toolchain anywhere else -- a Windows host without qemu-utils still builds
-# everything else.
+# Descriptors pointing at the raw images, so the same file boots under VMware
+# as under anything else.  Written by a script rather than converted by
+# qemu-img: a flat VMDK is a text file naming the image, and generating it
+# costs nothing and removes a tool from the list a host has to have.
+#
+# Always rebuilt, because the descriptor names a file whose size changes: a
+# stale one declares a geometry the image no longer has.
 VMDK_BIOS := $(BUILD)/barryOS-bios.vmdk
 VMDK_UEFI := $(BUILD)/barryOS-uefi.vmdk
 
 vmdk: $(BIOS_IMG) $(UEFI_IMG)
-	$(QEMU_IMG) convert -f raw -O vmdk $(BIOS_IMG) $(VMDK_BIOS)
-	$(QEMU_IMG) convert -f raw -O vmdk $(UEFI_IMG) $(VMDK_UEFI)
-	@ls -la $(VMDK_BIOS) $(VMDK_UEFI)
+	cd $(ROOT) && $(PYTHON) scripts/mk-vmdk.py build/barryOS-bios.img build/barryOS-bios.vmdk
+	cd $(ROOT) && $(PYTHON) scripts/mk-vmdk.py build/barryOS-uefi.img build/barryOS-uefi.vmdk
+
+.PHONY: vmdk-bios
+vmdk-bios: $(BIOS_IMG)
+	cd $(ROOT) && $(PYTHON) scripts/mk-vmdk.py build/barryOS-bios.img build/barryOS-bios.vmdk
 
 # ---------------------------------------------------------------------------
 #  QEMU runners
