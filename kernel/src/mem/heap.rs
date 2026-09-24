@@ -1,9 +1,15 @@
-//! Kernel heap allocator — bump allocator for Stage 2.
+//! Kernel heap allocator — bump allocator.
 //!
-//! Simplest correct allocator: a bump pointer into a 1 MiB heap region.
-//! `alloc` bumps the pointer; `dealloc` is a no-op.  Good enough to prove
-//! `#[global_allocator]` works with Vec/Box.  Stage 2b will upgrade to a
-//! free-list allocator with real deallocation.
+//! `alloc` bumps a pointer; `dealloc` is a no-op.  A bump allocator cannot
+//! reclaim one allocation, but it can reclaim *everything* allocated since a
+//! point — so `mark` and `reset_to` are here, and they are what make repeated
+//! work possible: a browser that parses a page into a tree of thousands of
+//! nodes has nothing to free individually and everything to free at once when
+//! the next page arrives.
+//!
+//! A free-list allocator with real deallocation would be the next step, and
+//! the one to take if anything ever needs to hold a long-lived allocation
+//! while short-lived ones come and go.
 
 use super::frame_alloc::BitmapFrameAllocator;
 use crate::serial;
@@ -11,8 +17,12 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// 1 MiB heap = 256 frames of 4 KiB.
-pub const HEAP_PAGES: usize = 256;
+/// 8 MiB heap = 2048 frames of 4 KiB.
+///
+/// It was 1 MiB, which is enough for a kernel and not enough for a document:
+/// a 32 KiB page becomes a tree of a few thousand nodes, and each node, its
+/// attributes and its text are separate allocations that are never given back.
+pub const HEAP_PAGES: usize = 2048;
 pub const HEAP_SIZE:  usize = HEAP_PAGES * 4096;
 
 /// Bump allocator state.  Uses atomics so it works even if the compiler
@@ -212,4 +222,45 @@ unsafe impl GlobalAlloc for BumpAlloc {
         // Bump allocator: no-op.  (Can't even count — keep it minimal to
         // avoid any issue during Vec reallocation.)
     }
+}
+
+/// Where the heap will be handed out from next.
+///
+/// Take one before doing work whose allocations are all wanted or all
+/// unwanted together, and `reset_to` it once they are finished with.  Only the
+/// caller can know that nothing allocated since the mark is still referenced,
+/// which is why this is not automatic.
+pub fn mark() -> usize {
+    HEAP.next.load(Ordering::SeqCst) as usize
+}
+
+/// Give back everything allocated since `m`.
+///
+/// # Safety
+///
+/// Every allocation made after `mark()` must be unreachable by the time this
+/// is called.  Holding one across a reset is a use-after-free that the language
+/// cannot see, because the memory is still mapped and still readable — it just
+/// belongs to something else now.
+pub unsafe fn reset_to(m: usize) {
+    let start = HEAP.heap_start.load(Ordering::SeqCst) as usize;
+    let end = HEAP.heap_end.load(Ordering::SeqCst) as usize;
+    if m < start || m > end {
+        return;
+    }
+    HEAP.next.store(m as u64, Ordering::SeqCst);
+}
+
+/// Bytes handed out and not reclaimed.
+pub fn used() -> usize {
+    let start = HEAP.heap_start.load(Ordering::SeqCst) as usize;
+    let next = HEAP.next.load(Ordering::SeqCst) as usize;
+    next.saturating_sub(start)
+}
+
+/// How much room is left before an allocation fails.
+pub fn free() -> usize {
+    let end = HEAP.heap_end.load(Ordering::SeqCst) as usize;
+    let next = HEAP.next.load(Ordering::SeqCst) as usize;
+    end.saturating_sub(next)
 }
