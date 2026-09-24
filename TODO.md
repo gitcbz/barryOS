@@ -127,9 +127,41 @@ Kept here so the delta is visible; older rounds are in CHANGELOG.md.
 ### Network
 - [x] **PCI bus enumeration** — ports 0xCF8/0xCFC, BAR decoding and size probing,
   lookup by vendor/device or by class. This was the prerequisite for any NIC.
+  It did not work until the scan stopped abandoning the bus when its device
+  table filled: a VMware guest puts the NIC at 2:0.0, behind a bridge, past the
+  32nd function.
 - [x] **e1000 driver, frame level** — find the adapter, reset, RX/TX descriptor
-  rings, link up, `send_frame` / `recv_frame`.
+  rings, link up, `send_frame` / `recv_frame`. It reported success for months
+  without transmitting: the transmit descriptor's command byte was zero, so
+  the card never saw an end-of-packet and dropped everything. `send_frame` now
+  waits for the descriptor to be marked done, which is what makes this an
+  observation rather than an assumption.
 - [x] **ARP** — request, reply, and a small mapping cache.
+- [x] **IPv4** — header, Internet checksum, next-hop decision. No fragmentation
+  in either direction; incoming fragments are counted and dropped.
+- [x] **ICMP echo** — `ping`, the smallest end-to-end proof the stack works.
+- [x] **UDP** and a port table.
+- [x] **DHCP client** — the interface used to come up as the static guess
+  192.168.1.100; the real subnet is 192.168.91.0/24. The lease now supplies the
+  address, mask, gateway and DNS server. `net::settle` drives the exchange
+  during boot, because the input loop that would otherwise advance it does not
+  start until after the login screen.
+- [x] **DNS** — one query type (A), plus the compressed-name walk.
+- [x] **TCP client** — one connection at a time: handshake, one segment out at
+  a time with retransmission, in-order receive, close. Sequence numbers and
+  ephemeral ports are seeded from the cycle counter; with a fixed base, a NAT
+  holding a stale mapping answered a new SYN with an acknowledgement from the
+  *previous* boot and the connection never came up.
+- [ ] **TCP is one connection at a time** — a second concurrent fetch has to
+  wait. Fine for a browser doing one request per page; not fine for anything
+  that fetches a page and its images, or opens two tabs.
+- [ ] **No `https`** — the browser says so rather than silently trying port 80.
+  TLS is a much larger piece of work than everything above it put together.
+- [ ] **No reassembly or congestion control** — no out-of-order queue (a late
+  segment costs a retransmission), no send window larger than one segment, no
+  slow start.
+- [ ] **DHCP lease renewal** — the lease is taken once and never renewed, and
+  there is no way to set an address by hand beyond the `ip` command.
 
 ### Tooling
 - [x] **Windows/msys2 build** — `scripts/env.msys.mk`, mingw-w64 gcc for the EFI
@@ -182,6 +214,10 @@ Kept here so the delta is visible; older rounds are in CHANGELOG.md.
 - [ ] **Widget toolkit** — buttons and a dock exist as ad-hoc drawing, not as a
   reusable control library. No menus, scrollbars, list views or text fields.
 - [ ] **Screenshot tool and image viewer** (planned in ARCHITECTURE.md).
+- [ ] **Browser: no links, no history, no images** — it fetches one page and
+  shows its text.  Following a link means retyping the address, there is no
+  back button, and inline images are skipped entirely rather than shown as
+  placeholders.
 - [ ] **Script arguments** — `run script a b` does not pass `$1`/`$2` through.
 - [ ] **`su` has no logout / no session lock**, and there is no way to change a
   password.
