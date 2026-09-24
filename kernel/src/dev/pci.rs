@@ -16,7 +16,14 @@ const CONFIG_ADDR: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
 
 /// How many devices we are willing to remember.
-pub const MAX_DEVICES: usize = 32;
+///
+/// This used to be 32, and the scan *returned* when it filled -- so a machine
+/// with more than 32 functions on the bus silently lost every device after the
+/// 32nd.  A VMware guest is over that line before it reaches the NIC, which
+/// sits at PCI slot 32.  The table is memory, not a protocol limit: keep
+/// counting past the end so the log at least says how many were dropped, and
+/// keep the whole bus scanned.
+pub const MAX_DEVICES: usize = 128;
 
 #[derive(Clone, Copy)]
 pub struct PciDevice {
@@ -147,6 +154,7 @@ pub fn init() {
     serial::print_str("[pci] scanning configuration space...\n");
 
     let mut n = 0usize;
+    let mut dropped = 0usize;
     for bus in 0u16..=255 {
         for dev in 0u8..32 {
             let vendor = config_read_u16(bus as u8, dev, 0, 0x00);
@@ -163,10 +171,10 @@ pub fn init() {
                     continue;
                 }
                 if n >= MAX_DEVICES {
-                    serial::print_str("[pci] device table full, stopping\n");
-                    COUNT.store(n, Ordering::Release);
-                    INITIALIZED.store(true, Ordering::Release);
-                    return;
+                    // Recording is full, scanning is not: a device we cannot
+                    // store must not hide the ones behind it.
+                    dropped += 1;
+                    continue;
                 }
 
                 let device = config_read_u16(bus as u8, dev, func, 0x02);
@@ -225,6 +233,11 @@ pub fn init() {
             }
             serial::print_str("\n");
         }
+    }
+    if dropped != 0 {
+        serial::print_str("[pci] ");
+        serial::print_hex(dropped as u64);
+        serial::print_str(" further device(s) not recorded (table full)\n");
     }
 
     INITIALIZED.store(true, Ordering::Release);
