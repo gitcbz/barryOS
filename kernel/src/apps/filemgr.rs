@@ -63,19 +63,24 @@ pub fn cwd() -> u64 {
 }
 
 /// Create the window, if it is not already open.
-pub fn init() {
-    if window::exists(window_id()) {
-        window::focus(window_id());
-        return;
-    }
-    let id = window::create(FM_POS_X, FM_POS_Y, FM_W, FM_H, "Files");
-    WIN_ID.store(id, Ordering::SeqCst);
+/// State setup without a window; see `terminal::init_state`.
+pub fn init_state() {
     CWD.store(vfs::ROOT_ID, Ordering::SeqCst);
     SELECTED.store(u64::MAX, Ordering::SeqCst);
     unsafe {
         MODE = Mode::Browse;
         STATUS_LEN = 0;
     }
+}
+
+pub fn init() {
+    if window::exists(window_id()) {
+        window::focus(window_id());
+        return;
+    }
+    init_state();
+    let id = window::create(FM_POS_X, FM_POS_Y, FM_W, FM_H, "Files");
+    WIN_ID.store(id, Ordering::SeqCst);
     refresh();
     serial::print_str("[apps] file manager: window created id=");
     serial::print_hex(id);

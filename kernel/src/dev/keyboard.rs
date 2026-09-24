@@ -53,6 +53,10 @@ pub const KEY_DOWN:      u8 = 0x12;
 pub const KEY_LEFT:      u8 = 0x13;
 pub const KEY_RIGHT:     u8 = 0x14;
 pub const KEY_DELETE:    u8 = 0x7F;
+pub const KEY_PAGE_UP:   u8 = 0x15;
+pub const KEY_PAGE_DOWN: u8 = 0x16;
+pub const KEY_HOME:      u8 = 0x17;
+pub const KEY_END:       u8 = 0x18;
 
 /// Modifier state.
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
@@ -135,6 +139,10 @@ pub fn handle_scancode(scancode: u8) {
                 0x4B => Some(KEY_LEFT),
                 0x4D => Some(KEY_RIGHT),
                 0x53 => Some(KEY_DELETE),
+                0x49 => Some(KEY_PAGE_UP),
+                0x51 => Some(KEY_PAGE_DOWN),
+                0x47 => Some(KEY_HOME),
+                0x4F => Some(KEY_END),
                 _ => None,
             };
             if let Some(k) = ext {

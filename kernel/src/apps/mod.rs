@@ -54,52 +54,26 @@ pub fn count() -> usize {
     COUNT
 }
 
-/// Initialize the apps that should be on screen at boot.
+/// Prepare the applications.
 ///
-/// The editor is deliberately not among them: it opens from the launcher or by
-/// picking a file in the file manager, which is how it gets something to edit.
+/// Nothing is put on screen.  The desktop comes up empty and apps are opened
+/// from the dock, which is what a desktop is for — and it means a boot does no
+/// network I/O and paints no window nobody asked for.  What still happens here
+/// is the state each app needs before it is opened: the terminal's empty screen
+/// and working directory (the boot self-test types into it), the file manager's
+/// directory listing, the browser's default address.
 pub fn init() {
-    serial::print_str("[apps] step 1: init terminal\n");
-    terminal::init();
+    serial::print_str("[apps] step 1: terminal state\n");
+    terminal::init_state();
 
-    serial::print_str("[apps] step 2: init file manager\n");
-    filemgr::init();
+    serial::print_str("[apps] step 2: file manager state\n");
+    filemgr::init_state();
 
-    serial::print_str("[apps] step 3: init system info\n");
-    sysinfo::init();
-
-    serial::print_str("[apps] step 4: init browser\n");
-    browser::init();
-    load_home_page();
+    serial::print_str("[apps] step 3: browser state\n");
+    browser::init_state();
 
     INITIALIZED.store(true, Ordering::Release);
-    serial::print_str("[apps] desktop applications online\n");
-}
-
-/// Fetch the browser's home page during boot.
-///
-/// A fetch only advances when somebody calls `net::poll`, and the loop that
-/// does that does not start until after the login screen — which waits for a
-/// human.  Left to the input loop, the browser would sit on "Loading..." for
-/// as long as nobody typed a password.  Pumping it here means the first
-/// composite already shows a page, and the boot log says whether the top half
-/// of the network stack — TCP, HTTP and the markup-to-lines pass — came out
-/// right.
-fn load_home_page() {
-    if !crate::net::configured() {
-        return;
-    }
-    browser::open_with(browser::HOME);
-    // Bounded by a deadline of our own, so a machine with no route out loses a
-    // couple of seconds and then carries on with an empty window.
-    let start = crate::interrupts::TIMER_TICKS.load(Ordering::Relaxed);
-    while crate::net::http::in_progress()
-        && crate::interrupts::TIMER_TICKS.load(Ordering::Relaxed)
-            .saturating_sub(start) < 2500
-    {
-        crate::net::poll();
-        browser::tick();
-    }
+    serial::print_str("[apps] applications ready (nothing opened)\n");
 }
 
 /// Draw the content of the window with this id.

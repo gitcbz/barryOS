@@ -80,11 +80,18 @@ static mut PENDING_USER_LEN: usize = 0;
 pub fn window_id() -> u64 { unsafe { WIN_ID } }
 
 /// Initialize the terminal: create its window.
-pub fn init() {
-    let id = window::create(WIN_POS_X, WIN_POS_Y, WIN_W, WIN_H, "Terminal");
-    unsafe { WIN_ID = id; }
+/// Everything the terminal needs before it has a window: an empty screen and a
+/// working directory.  Split out because the boot self-test runs commands
+/// through it, and nothing should be on the desktop until it is asked for.
+pub fn init_state() {
     clear_buffer();
     CWD.store(vfs::ROOT_ID, Ordering::SeqCst);
+}
+
+pub fn init() {
+    init_state();
+    let id = window::create(WIN_POS_X, WIN_POS_Y, WIN_W, WIN_H, "Terminal");
+    unsafe { WIN_ID = id; }
     serial::print_str("[apps] terminal: window created id=");
     serial::print_hex(id);
     serial::print_str("\n");

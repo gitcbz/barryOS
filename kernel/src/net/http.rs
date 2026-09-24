@@ -76,6 +76,16 @@ static REDIRECT: AtomicBool = AtomicBool::new(false);
 /// ARP exchange without re-running DNS.
 static REMOTE: AtomicU32 = AtomicU32::new(0);
 
+/// The Location header of the response, if it had one.
+static mut LOCATION: [u8; 256] = [0; 256];
+static LOCATION_LEN: AtomicU32 = AtomicU32::new(0);
+
+/// Redirects followed so far, and the most we will follow.  A page that
+/// redirects to itself would otherwise loop forever, and each hop costs a DNS
+/// lookup, a connection and a request.
+static HOPS: AtomicU8 = AtomicU8::new(0);
+const MAX_HOPS: u8 = 5;
+
 /// How long a whole fetch may take before it is declared failed.  20 seconds
 /// is well past a LAN fetch of anything a text browser can show.
 const DEADLINE_SECS: u32 = 20;
@@ -117,6 +127,7 @@ pub fn error() -> &'static str {
         5 => "the request was lost",
         6 => "the server closed without a response",
         7 => "timed out",
+        8 => "too many redirects",
         _ => "",
     }
 }
@@ -136,8 +147,15 @@ pub fn read_body(offset: usize, out: &mut [u8]) -> usize {
     tcp::rx_read_at(body_offset() + offset, out)
 }
 
-/// Begin fetching `url`.  Returns false if it cannot be parsed.
+/// Begin fetching `url`, following no redirects.
 pub fn start(url: &str) -> bool {
+    HOPS.store(0, Ordering::Relaxed);
+    begin(url)
+}
+
+/// Begin fetching `url`, keeping the redirect count — a hop must not reset the
+/// budget, which is exactly how a redirect loop would get in.
+fn begin(url: &str) -> bool {
     tcp::reset();
     PHASE.store(phase_to_u8(Phase::Idle), Ordering::Relaxed);
     STATUS.store(0, Ordering::Relaxed);
@@ -147,6 +165,7 @@ pub fn start(url: &str) -> bool {
     REQUEST_SENT.store(false, Ordering::Relaxed);
     ERROR.store(0, Ordering::Relaxed);
     REDIRECT.store(false, Ordering::Relaxed);
+    LOCATION_LEN.store(0, Ordering::Relaxed);
     DEADLINE_TICK.store(0, Ordering::Relaxed);
 
     // Strip a scheme if there is one.  https is not implemented and saying so
@@ -329,6 +348,14 @@ pub fn tick() {
             if !HEADERS_PARSED.load(Ordering::Relaxed) {
                 parse_headers();
             }
+            // A redirect is decided as soon as the status and Location are in:
+            // there is no point reading the body of a 301, and on a long one
+            // that is most of the fetch.  The status alone is not enough —
+            // Content-Length being present does not survive a reconnect.
+            if is_redirect() && LOCATION_LEN.load(Ordering::Relaxed) != 0 {
+                follow_redirect();
+                return;
+            }
             // HTTP/1.0 with Connection: close means the peer's FIN is the end
             // of the body.  A declared Content-Length lets us finish sooner.
             let declared = body_declared();
@@ -425,8 +452,14 @@ fn parse_headers() {
         let line = &all[line_start..line_end];
         if let Some(v) = header_value(line, b"content-length:") {
             BODY_DECLARED.store(parse_dec(v) as u32, Ordering::Relaxed);
-        } else if header_value(line, b"location:").is_some() {
+        } else if let Some(v) = header_value(line, b"location:") {
             REDIRECT.store(true, Ordering::Relaxed);
+            let dst = core::ptr::addr_of_mut!(LOCATION) as *mut u8;
+            let n = v.len().min(256);
+            for i in 0..n {
+                unsafe { core::ptr::write_volatile(dst.add(i), v[i]) };
+            }
+            LOCATION_LEN.store(n as u32, Ordering::Relaxed);
         }
         line_start = line_end + 2;
         if line_start >= end {
@@ -481,7 +514,84 @@ fn parse_dec(v: &[u8]) -> u64 {
     n
 }
 
-/// Are we in the middle of a fetch?
+/// Follow the Location the response carried.
+///
+/// Location comes in three shapes and all three turn up in the wild: a full
+/// URL, a root-relative path, and a bare relative one.  The last two have to
+/// be resolved against the host we asked for, which is the only part of the
+/// current request worth keeping.
+fn follow_redirect() {
+    let hops = HOPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if hops > MAX_HOPS {
+        ERROR.store(8, Ordering::Relaxed);
+        PHASE.store(phase_to_u8(Phase::Failed), Ordering::Relaxed);
+        tcp::reset();
+        serial::print_str("[http] gave up after ");
+        serial::print_dec(hops as u64);
+        serial::print_str(" redirects\n");
+        return;
+    }
+
+    let mut loc = [0u8; 256];
+    let n = (LOCATION_LEN.load(Ordering::Relaxed) as usize).min(256);
+    let src = core::ptr::addr_of!(LOCATION) as *const u8;
+    for (i, slot) in loc.iter_mut().enumerate().take(n) {
+        *slot = unsafe { core::ptr::read_volatile(src.add(i)) };
+    }
+    let loc = core::str::from_utf8(&loc[..n]).unwrap_or("");
+
+    let mut url = [0u8; 384];
+    let mut len = 0usize;
+    {
+        let mut push = |s: &str, len: &mut usize| {
+            for &b in s.as_bytes() {
+                if *len >= url.len() {
+                    return;
+                }
+                url[*len] = b;
+                *len += 1;
+            }
+        };
+        if loc.starts_with("https://") {
+            // Following into TLS would need a TLS client, which does not exist
+            // yet.  Say that rather than silently fetching the plaintext port.
+            ERROR.store(1, Ordering::Relaxed);
+            PHASE.store(phase_to_u8(Phase::Failed), Ordering::Relaxed);
+            tcp::reset();
+            serial::print_str("[http] redirect to https, which is not implemented\n");
+            return;
+        }
+        if loc.starts_with("http://") {
+            push(loc, &mut len);
+        } else {
+            push("http://", &mut len);
+            let mut host = [0u8; 128];
+            let hn = target_into(&mut host);
+            push(core::str::from_utf8(&host[..hn]).unwrap_or(""), &mut len);
+            if !loc.starts_with('/') {
+                push("/", &mut len);
+            }
+            push(loc, &mut len);
+        }
+    }
+    let target = core::str::from_utf8(&url[..len]).unwrap_or("");
+
+    serial::print_str("[http] redirect ");
+    serial::print_dec(STATUS.load(Ordering::Relaxed) as u64);
+    serial::print_str(" -> ");
+    serial::print_str(target);
+    serial::print_str("\n");
+
+    tcp::reset();
+    begin(target);
+}
+
+/// How many redirects the last fetch followed — shown in the status line.
+pub fn hops() -> u8 {
+    HOPS.load(Ordering::Relaxed)
+}
+
+/// Is we in the middle of a fetch?
 pub fn in_progress() -> bool {
     matches!(phase(),
              Phase::Resolving | Phase::Connecting | Phase::Sending | Phase::Receiving)

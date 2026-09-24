@@ -13,11 +13,13 @@
 //! keeps redrawing, and why the pointer keeps moving, while a page loads.
 
 use crate::dev::keyboard::{
-    KEY_BACKSPACE, KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_TAB, KEY_UP,
+    KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_ENTER, KEY_HOME, KEY_LEFT,
+    KEY_PAGE_DOWN, KEY_PAGE_UP, KEY_RIGHT, KEY_UP,
 };
 use crate::net::http;
 use crate::serial;
-use crate::wm::{font, window};
+use crate::wm::font;
+use crate::wm::window::{self, TITLE_BAR_H};
 
 static mut BR_WIN_ID: u64 = 0;
 
@@ -30,15 +32,19 @@ const WIN_H: u32 = 440;
 const CW: u32 = 8;
 const CH: u32 = 16;
 
-/// Above the page: the address bar.
-const TOOLBAR_H: u32 = 26;
+/// Above the page: the address bar, measured from the bottom of the title bar
+/// so the drawing and the click test cannot drift apart.  They did: the hit
+/// test put the boundary at `wy + 26` while the field was *drawn* from `wy+20`
+/// to `wy+40`, so clicking the address bar almost always landed in the page
+/// and handed the keyboard to the scroller.
+const TOOLBAR_H: u32 = 28;
 /// Below it: where the fetch got to.
 const STATUS_H: u32 = 22;
 
 /// Text column limit, from the window width less a small margin.
 const COLS: usize = ((WIN_W - 20) / CW) as usize;
 /// Rows of page text visible at once.
-const ROWS: usize = ((WIN_H - TOOLBAR_H - STATUS_H - 8) / CH) as usize;
+const ROWS: usize = ((WIN_H - TITLE_BAR_H - TOOLBAR_H - STATUS_H - 8) / CH) as usize;
 
 const PAGE_CAP: usize = 32 * 1024;
 const MAX_LINES: usize = 2048;
@@ -63,14 +69,6 @@ static mut URL: [u8; MAX_URL] = [0; MAX_URL];
 static mut URL_LEN: usize = 0;
 static mut CARET: usize = 0;
 
-/// Where typing goes.  Tab switches.
-#[derive(Clone, Copy, PartialEq)]
-enum Focus {
-    Address,
-    Page,
-}
-static mut FOCUS: Focus = Focus::Address;
-
 /// The phase the last paint was made in, so the window is only redrawn when
 /// something has actually changed.
 static mut LAST_PHASE: u8 = 255;
@@ -87,10 +85,15 @@ pub fn window_id() -> u64 {
     unsafe { BR_WIN_ID }
 }
 
+/// State setup without a window; see `terminal::init_state`.
+pub fn init_state() {
+    set_url(HOME);
+}
+
 pub fn init() {
+    init_state();
     let id = window::create(WIN_X, WIN_Y, WIN_W, WIN_H, "Browser");
     unsafe { BR_WIN_ID = id; }
-    set_url(HOME);
     serial::print_str("[apps] browser: window created id=");
     serial::print_hex(id);
     serial::print_str("\n");
@@ -147,7 +150,6 @@ fn go() {
         LINE_COUNT = 0;
         TOP = 0;
         CAPTURED = false;
-        FOCUS = Focus::Page;
     }
     if !http::start(text) {
         serial::print_str("[browser] request refused at start\n");
@@ -158,36 +160,84 @@ fn go() {
 //  Input
 // ---------------------------------------------------------------------------
 
-pub fn on_click(_px: u32, py: u32) -> bool {
-    let (_wx, wy) = window::position(window_id()).unwrap_or((WIN_X, WIN_Y));
-    // A click in the toolbar gives the address bar the keyboard; anywhere
-    // else gives it to the page, which is what makes the arrows scroll.
-    unsafe {
-        FOCUS = if (py as i32 - wy as i32) < TOOLBAR_H as i32 {
-            Focus::Address
-        } else {
-            Focus::Page
-        };
+/// A click puts the caret where it was clicked in the address bar, or — below
+/// the toolbar — scrolls the page to the top.
+///
+/// The browser has no forms, so there is exactly one place text can go and no
+/// mode to get stuck in.  The previous version had two, and the first fetch
+/// moved the keyboard to the page with no way back short of closing the window.
+pub fn on_click(px: u32, py: u32) -> bool {
+    let (wx, wy) = window::position(window_id()).unwrap_or((WIN_X, WIN_Y));
+    let rel_y = py as i32 - wy as i32;
+    if rel_y < (TITLE_BAR_H + TOOLBAR_H) as i32 {
+        // Clamp the caret to the text that is actually there.
+        let rel_x = (px as i32 - wx as i32 - 10).max(0) as usize;
+        let col = (rel_x / CW as usize).min(unsafe { URL_LEN });
+        unsafe { CARET = col; }
+    } else {
+        unsafe { TOP = 0; }
     }
     true
 }
 
 pub fn handle_key(key: u8) -> bool {
-    let focused = unsafe { FOCUS };
     match key {
-        KEY_TAB => {
-            unsafe {
-                FOCUS = if focused == Focus::Address { Focus::Page } else { Focus::Address };
-            }
-            true
-        }
+        // Printable characters and the editing keys all go to the address bar.
+        // There are no forms on a page, so this is the only place text can go
+        // and there is no mode to be stuck in.
         KEY_ENTER => {
             go();
             true
         }
-        KEY_ESC => {
-            http::start("");            // resets the client
-            unsafe { PAGE_LEN = 0; LINE_COUNT = 0; TOP = 0; }
+        KEY_BACKSPACE => {
+            unsafe {
+                if CARET > 0 {
+                    let base = core::ptr::addr_of_mut!(URL) as *mut u8;
+                    for i in CARET - 1..URL_LEN.saturating_sub(1) {
+                        let v = core::ptr::read_volatile(base.add(i + 1));
+                        core::ptr::write_volatile(base.add(i), v);
+                    }
+                    URL_LEN -= 1;
+                    CARET -= 1;
+                }
+            }
+            true
+        }
+        KEY_DELETE => {
+            unsafe {
+                if CARET < URL_LEN {
+                    let base = core::ptr::addr_of_mut!(URL) as *mut u8;
+                    for i in CARET..URL_LEN.saturating_sub(1) {
+                        let v = core::ptr::read_volatile(base.add(i + 1));
+                        core::ptr::write_volatile(base.add(i), v);
+                    }
+                    URL_LEN -= 1;
+                }
+            }
+            true
+        }
+        KEY_LEFT => {
+            unsafe {
+                if CARET > 0 {
+                    CARET -= 1;
+                }
+            }
+            true
+        }
+        KEY_RIGHT => {
+            unsafe {
+                if CARET < URL_LEN {
+                    CARET += 1;
+                }
+            }
+            true
+        }
+        KEY_HOME => {
+            unsafe { CARET = 0; }
+            true
+        }
+        KEY_END => {
+            unsafe { CARET = URL_LEN; }
             true
         }
         KEY_UP => {
@@ -198,66 +248,28 @@ pub fn handle_key(key: u8) -> bool {
             scroll(1);
             true
         }
-        KEY_LEFT => {
-            if focused == Focus::Address {
-                unsafe {
-                    if CARET > 0 {
-                        CARET -= 1;
-                    }
-                }
-            } else {
-                scroll(-(ROWS as isize));
-            }
+        KEY_PAGE_UP => {
+            scroll(-(ROWS as isize));
             true
         }
-        KEY_RIGHT => {
-            if focused == Focus::Address {
-                unsafe {
-                    if CARET < URL_LEN {
-                        CARET += 1;
-                    }
-                }
-            } else {
-                scroll(ROWS as isize);
-            }
+        KEY_PAGE_DOWN => {
+            scroll(ROWS as isize);
             true
-        }
-        KEY_BACKSPACE => {
-            if focused == Focus::Address {
-                unsafe {
-                    if CARET > 0 {
-                        let base = core::ptr::addr_of_mut!(URL) as *mut u8;
-                        for i in CARET - 1..URL_LEN.saturating_sub(1) {
-                            let v = core::ptr::read_volatile(base.add(i + 1));
-                            core::ptr::write_volatile(base.add(i), v);
-                        }
-                        URL_LEN -= 1;
-                        CARET -= 1;
-                    }
-                }
-                true
-            } else {
-                false
-            }
         }
         ch if (0x20..0x7F).contains(&ch) => {
-            if focused == Focus::Address {
-                unsafe {
-                    if URL_LEN < MAX_URL {
-                        let base = core::ptr::addr_of_mut!(URL) as *mut u8;
-                        for i in (CARET..URL_LEN).rev() {
-                            let v = core::ptr::read_volatile(base.add(i));
-                            core::ptr::write_volatile(base.add(i + 1), v);
-                        }
-                        core::ptr::write_volatile(base.add(CARET), ch);
-                        URL_LEN += 1;
-                        CARET += 1;
+            unsafe {
+                if URL_LEN < MAX_URL {
+                    let base = core::ptr::addr_of_mut!(URL) as *mut u8;
+                    for i in (CARET..URL_LEN).rev() {
+                        let v = core::ptr::read_volatile(base.add(i));
+                        core::ptr::write_volatile(base.add(i + 1), v);
                     }
+                    core::ptr::write_volatile(base.add(CARET), ch);
+                    URL_LEN += 1;
+                    CARET += 1;
                 }
-                true
-            } else {
-                false
             }
+            true
         }
         _ => false,
     }
@@ -524,31 +536,36 @@ pub fn render() {
     draw_status(wx, wy);
 }
 
+/// Top of the address field, in window coordinates.
+fn toolbar_y() -> u32 {
+    TITLE_BAR_H + 4
+}
+
 fn draw_toolbar(wx: u32, wy: u32) {
-    let focused = unsafe { FOCUS } == Focus::Address;
     // A filled bar rather than a border: at 8x16 there is no room for both.
-    draw_rect(wx + 6, wy + 20, WIN_W - 12, 20,
-              if focused { (0x1E, 0x28, 0x3C) } else { (0x18, 0x18, 0x20) });
+    draw_rect(wx + 6, wy + toolbar_y(), WIN_W - 12, 20, (0x1E, 0x28, 0x3C));
 
     let raw = url_bytes();
+    let cols = ((WIN_W - 24) / CW) as usize;
+    // Scroll the text so the caret is always visible: a URL longer than the
+    // field used to be drawn off the right edge with the caret gone with it.
+    let caret = unsafe { CARET };
+    let first = caret.saturating_sub(cols.saturating_sub(1));
     let mut x = wx + 10;
-    for (i, &b) in raw.iter().enumerate() {
-        if i as u32 >= (WIN_W - 24) / CW {
-            break;
-        }
-        // A caret drawn as a reversed cell is the only cursor this font has.
-        let here = unsafe { focused && i == CARET };
+    let ty = wy + toolbar_y() + 2;
+    for i in first..raw.len().min(first + cols) {
+        let here = i == caret;
         let pal = if here { (0x10, 0xB9, 0x81) } else { (0xEA, 0xEA, 0xEA) };
-        font::draw_char(b, x, wy + 22, pal.0, pal.1, pal.2);
+        font::draw_char(raw[i], x, ty, pal.0, pal.1, pal.2);
         x += CW;
     }
-    if unsafe { focused && CARET >= raw.len() } {
-        draw_rect(x, wy + 21, 2, 17, (0x10, 0xB9, 0x81));
+    if caret >= raw.len() && (caret - first) < cols {
+        draw_rect(x, ty + 1, 2, 14, (0x10, 0xB9, 0x81));
     }
 }
 
 fn draw_page(wx: u32, wy: u32) {
-    let top_y = wy + TOOLBAR_H + 20;
+    let top_y = wy + TITLE_BAR_H + TOOLBAR_H + 6;
     let count = unsafe { LINE_COUNT };
     if count == 0 {
         let msg = match http::phase() {
@@ -654,6 +671,12 @@ fn fmt_u64(mut v: u64, buf: &mut [u8; 24]) -> usize {
 /// the phase has changed and repaint, so a page appears as soon as it lands
 /// without the compositor redrawing the browser sixty times a second.
 pub fn tick() -> bool {
+    // Nothing to repaint while the window is closed.  The fetch itself is
+    // driven by net::tick regardless, so a page started before the window was
+    // closed still finishes and is there when it is opened again.
+    if !window::exists(window_id()) {
+        return false;
+    }
     let phase = http::phase() as u8;
     let body = http::body_len();
     let changed = unsafe { phase != LAST_PHASE || body != LAST_BODY };
