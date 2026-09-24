@@ -67,6 +67,26 @@ const EERD_DONE:  u32 = 1 << 4;
 const RXD_STAT_DD: u8 = 1 << 0;       // descriptor done
 const RXD_STAT_EOP: u8 = 1 << 1;      // end of packet revision
 
+/// TX descriptor command bits (legacy layout, byte 11 of the descriptor).
+///
+/// These are not optional.  EOP is what tells the card the descriptor holds a
+/// complete packet — without it the transmit engine keeps waiting for the rest
+/// of one and nothing ever leaves the adapter.  IFCS appends the Ethernet FCS,
+/// and RS asks for the done bit to be set in the status byte.
+///
+/// The first version of this driver wrote zero here, so `send_frame` filled
+/// buffers, bumped TDT and reported success while the wire stayed silent:
+/// every ARP request and every DHCP DISCOVER went into the ring and stopped
+/// there.
+const TXD_CMD_EOP: u8 = 1 << 0;
+const TXD_CMD_IFCS: u8 = 1 << 1;
+const TXD_CMD_RS: u8 = 1 << 3;
+const TXD_STAT_DD: u8 = 1 << 0;
+
+/// Transmits whose descriptor never came back marked done.
+pub static TX_STALLS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 static PRESENT: AtomicBool = AtomicBool::new(false);
 static MMIO_BASE: AtomicU32 = AtomicU32::new(0);
 static MAC_LO: AtomicU32 = AtomicU32::new(0);
@@ -312,8 +332,11 @@ pub fn send_frame(frame: &[u8]) -> bool {
         let d = (ring as *mut u8).add(tail * 16);
         // length
         core::ptr::write_volatile(d.add(8) as *mut u16, frame.len() as u16);
-        // cso, cmd (0 = no offload), status, css, special
-        for b in 10..16 {
+        // cso = 0 (no checksum offload), then the command byte, then status,
+        // css and special all cleared.
+        core::ptr::write_volatile(d.add(10), 0);
+        core::ptr::write_volatile(d.add(11), TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS);
+        for b in 12..16 {
             core::ptr::write_volatile(d.add(b), 0);
         }
     }
@@ -322,6 +345,25 @@ pub fn send_frame(frame: &[u8]) -> bool {
     TX_TAIL.store(next, Ordering::Relaxed);
     mmio_write(REG_TDT, next);
     TX_FRAMES.fetch_add(1, Ordering::Relaxed);
+
+    // Wait for the card to mark the descriptor done.  This is not needed to
+    // transmit — the ring works either way — but without it "the frame went
+    // out" is an assumption, and an assumption is what let a zeroed command
+    // byte sit here unnoticed while every packet was dropped on the floor.
+    let mut spins = 0u32;
+    loop {
+        let status = unsafe {
+            core::ptr::read_volatile((ring as *const u8).add(tail * 16).add(12))
+        };
+        if status & TXD_STAT_DD != 0 {
+            break;
+        }
+        spins += 1;
+        if spins > 1_000_000 {
+            TX_STALLS.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+    }
     true
 }
 
