@@ -32,6 +32,7 @@ mod apps;
 mod compat;
 mod vmware;
 mod net;
+mod crypto;
 
 use core::sync::atomic::Ordering;
 
@@ -131,6 +132,10 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
 
     wm::boot::stage(6, "Loading compatibility layers...");
     compat::init();
+
+    // Before the network is used for anything that needs a key: the vectors
+    // here are what decides whether the browser will speak TLS at all.
+    crypto::init();
 
     wm::boot::stage(7, "Checking for VMware...");
     vmware::init();

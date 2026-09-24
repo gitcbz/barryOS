@@ -10,6 +10,7 @@
 //! Everything here is a state machine advanced by `tick()`, because a fetch
 //! takes seconds and the desktop has to keep drawing while it happens.
 
+use crate::crypto::tls;
 use crate::net::{dns, tcp};
 use crate::serial;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
@@ -76,6 +77,11 @@ static REDIRECT: AtomicBool = AtomicBool::new(false);
 /// ARP exchange without re-running DNS.
 static REMOTE: AtomicU32 = AtomicU32::new(0);
 
+/// Is this fetch going through TLS?  Set by the scheme in the URL, and read
+/// by every step that has to choose between the record layer and the raw
+/// one.
+static USE_TLS: AtomicBool = AtomicBool::new(false);
+
 /// The Location header of the response, if it had one.
 static mut LOCATION: [u8; 256] = [0; 256];
 static LOCATION_LEN: AtomicU32 = AtomicU32::new(0);
@@ -136,15 +142,27 @@ pub fn is_redirect() -> bool {
     REDIRECT.load(Ordering::Relaxed)
 }
 
+/// Bytes received on whichever transport this fetch is using.
+fn rx_len() -> usize {
+    if USE_TLS.load(Ordering::Relaxed) { tls::rx_len() } else { tcp::rx_len() }
+}
+
+fn rx_read_at(offset: usize, out: &mut [u8]) -> usize {
+    if USE_TLS.load(Ordering::Relaxed) {
+        tls::rx_read_at(offset, out)
+    } else {
+        tcp::rx_read_at(offset, out)
+    }
+}
+
 /// Number of body bytes actually received.
 pub fn body_len() -> usize {
-    let total = tcp::rx_len();
-    total.saturating_sub(body_offset())
+    rx_len().saturating_sub(body_offset())
 }
 
 /// Copy part of the body out of the receive buffer.
 pub fn read_body(offset: usize, out: &mut [u8]) -> usize {
-    tcp::rx_read_at(body_offset() + offset, out)
+    rx_read_at(body_offset() + offset, out)
 }
 
 /// Begin fetching `url`, following no redirects.
@@ -168,15 +186,17 @@ fn begin(url: &str) -> bool {
     LOCATION_LEN.store(0, Ordering::Relaxed);
     DEADLINE_TICK.store(0, Ordering::Relaxed);
 
-    // Strip a scheme if there is one.  https is not implemented and saying so
-    // beats silently trying port 80.
-    let rest = if let Some(r) = url.strip_prefix("http://") {
-        r
-    } else if url.starts_with("https://") {
-        return fail(1, "[http] https is not implemented");
+    // The scheme decides the port and whether the record layer is TLS.  There
+    // is no fallback from https to http: a client that quietly downgrades is
+    // worse than one that refuses.
+    let (rest, tls_on) = if let Some(r) = url.strip_prefix("https://") {
+        (r, true)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (r, false)
     } else {
-        url
+        (url, false)
     };
+    USE_TLS.store(tls_on, Ordering::Relaxed);
 
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -187,12 +207,13 @@ fn begin(url: &str) -> bool {
     }
 
     // host[:port]
+    let default_port = if tls_on { 443 } else { 80 };
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => match p.parse::<u16>() {
             Ok(v) => (h, v),
-            Err(_) => (authority, 80),
+            Err(_) => (authority, default_port),
         },
-        None => (authority, 80),
+        None => (authority, default_port),
     };
     if host.is_empty() || host.len() > 127 {
         return fail(1, "[http] host name too long");
@@ -202,7 +223,8 @@ fn begin(url: &str) -> bool {
     copy_into(core::ptr::addr_of_mut!(TARGET) as *mut u8, 128, &TARGET_LEN, host);
     build_request(host, path);
 
-    serial::print_str("[http] GET http://");
+    serial::print_str("[http] GET ");
+    serial::print_str(if tls_on { "https://" } else { "http://" });
     serial::print_str(host);
     serial::print_str(path);
     serial::print_str("\n");
@@ -296,6 +318,25 @@ pub fn tick() {
             }
         }
         Phase::Connecting => {
+            if USE_TLS.load(Ordering::Relaxed) {
+                // TLS owns the socket: it drives DNS, TCP and then its own
+                // handshake, and reports when it is ready to carry bytes.
+                tls::tick();
+                match tls::phase() {
+                    tls::Phase::Established => {
+                        PHASE.store(phase_to_u8(Phase::Sending), Ordering::Relaxed);
+                    }
+                    tls::Phase::Failed | tls::Phase::Closed => {
+                        serial::print_str("[http] ");
+                        serial::print_str(tls::error());
+                        serial::print_str("\n");
+                        ERROR.store(4, Ordering::Relaxed);
+                        PHASE.store(phase_to_u8(Phase::Failed), Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+                return;
+            }
             tcp::tick();
             match tcp::state() {
                 tcp::State::Established => {
@@ -322,7 +363,7 @@ pub fn tick() {
             }
         }
         Phase::Sending => {
-            tcp::tick();
+            if USE_TLS.load(Ordering::Relaxed) { tls::tick(); } else { tcp::tick(); }
             if !REQUEST_SENT.load(Ordering::Relaxed) {
                 let n = REQ_LEN.load(Ordering::Relaxed) as usize;
                 let mut req = [0u8; 512];
@@ -330,7 +371,12 @@ pub fn tick() {
                 for (i, slot) in req.iter_mut().enumerate().take(n.min(512)) {
                     *slot = unsafe { core::ptr::read_volatile(base.add(i)) };
                 }
-                if tcp::send(&req[..n.min(512)]) {
+                let sent = if USE_TLS.load(Ordering::Relaxed) {
+                    tls::send(&req[..n.min(512)])
+                } else {
+                    tcp::send(&req[..n.min(512)])
+                };
+                if sent {
                     REQUEST_SENT.store(true, Ordering::Relaxed);
                     PHASE.store(phase_to_u8(Phase::Receiving), Ordering::Relaxed);
                     serial::print_str("[http] request sent (");
@@ -344,7 +390,7 @@ pub fn tick() {
             }
         }
         Phase::Receiving => {
-            tcp::tick();
+            if USE_TLS.load(Ordering::Relaxed) { tls::tick(); } else { tcp::tick(); }
             if !HEADERS_PARSED.load(Ordering::Relaxed) {
                 parse_headers();
             }
@@ -365,16 +411,15 @@ pub fn tick() {
                 log_done();
                 return;
             }
-            match tcp::state() {
-                tcp::State::Failed => {
-                    ERROR.store(6, Ordering::Relaxed);
-                    PHASE.store(phase_to_u8(Phase::Failed), Ordering::Relaxed);
-                }
-                tcp::State::Closed | tcp::State::FinSent if tcp::peer_closed() => {
-                    PHASE.store(phase_to_u8(Phase::Done), Ordering::Relaxed);
-                    log_done();
-                }
-                _ => {}
+            let transport_done = if USE_TLS.load(Ordering::Relaxed) {
+                tls::phase() == tls::Phase::Closed
+            } else {
+                matches!(tcp::state(), tcp::State::Closed | tcp::State::FinSent)
+                    && tcp::peer_closed()
+            };
+            if transport_done {
+                PHASE.store(phase_to_u8(Phase::Done), Ordering::Relaxed);
+                log_done();
             }
         }
         _ => {}
@@ -412,7 +457,7 @@ fn log_done() {
 /// Find the end of the headers and pick out the fields worth keeping.
 fn parse_headers() {
     let mut all = [0u8; tcp::RX_CAP];
-    let n = tcp::rx_peek(&mut all);
+    let n = rx_read_at(0, &mut all);
     if n < 12 {
         return;                                 // wait for more
     }

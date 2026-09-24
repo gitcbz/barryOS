@@ -7,3 +7,6 @@ kernel/target/
 *.swp
 *~
 .DS_Store
+
+# Python bytecode from the build-time generators
+__pycache__/

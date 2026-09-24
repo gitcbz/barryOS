@@ -56,6 +56,23 @@ EFI_APP     := $(BUILD)/BOOTX64.EFI
 UEFI_IMG    := $(BUILD)/barryOS-uefi.img
 ISO         := $(BUILD)/barryOS.iso
 
+# Which certificate authorities the TLS client believes, generated from the
+# Mozilla bundle.  Defined here rather than beside its rule below, because a
+# `:=` variable expands where it is defined and the kernel rule needs to have
+# already seen it.  TRUST_ROOTS prunes the list: the full 121 roots are 85 KiB
+# of source and the BIOS loader gives the kernel 572 KiB in total.  Raise it
+# once the loader can stage more.
+CACERT        := $(BUILD)/cacert.pem
+TRUSTSTORE_RS := $(BUILD)/truststore.rs
+TRUST_ROOTS   ?= SSL.com TLS ECC Root CA 2022,ISRG Root X1,DigiCert Global Root G2,GTS Root R1,USERTrust ECC,USERTrust RSA
+# The trust store generator parses certificates, so it needs the `cryptography`
+# package -- which the msys2 python does not have, and which is not needed for
+# anything else here.  Kept as its own variable rather than reusing PYTHON, so
+# that pointing it somewhere else does not also change how the images are made.
+# On Linux (CI) this is a python3 with the cryptography package installed; on
+# Windows scripts/env.msys.mk points it at an interpreter that has it.
+TRUST_PYTHON  ?= python3
+
 # sizes
 BIOS_IMG_SECTORS := 8192       # 4 MiB BIOS image
 # How much room the loader has for the kernel image.  The BIOS path stages the
@@ -70,7 +87,7 @@ KERNEL_MAX_BYTES := 585728     # 0x8F000 = 0x9F000 - 0x10000
                                # image size has to satisfy every boot path
 KERNEL_IMG_LBA   := 41         # must match KERNEL_DISK_LBA in stage2.asm
 
-.PHONY: all kernel bios uefi iso vmdk pe-check clean check run-bios run-uefi fmt clippy help
+.PHONY: all kernel bios uefi iso vmdk pe-check truststore clean check run-bios run-uefi fmt clippy help
 
 # pe-check is part of `all`: the test PE and the loader's Win32 table are two
 # files that have to agree, and nothing else in the build would notice if they
@@ -97,7 +114,7 @@ help:
 # ---------------------------------------------------------------------------
 kernel: $(KERN_ELF) $(KERN_BIN)
 
-$(KERN_ELF): $(shell find $(KERN_DIR)/src -name '*.rs') $(KERN_DIR)/Cargo.toml $(KERN_DIR)/linker.ld $(KERN_DIR)/.cargo/config.toml $(BOOTIMG_RS)
+$(KERN_ELF): $(shell find $(KERN_DIR)/src -name '*.rs') $(KERN_DIR)/Cargo.toml $(KERN_DIR)/linker.ld $(KERN_DIR)/.cargo/config.toml $(BOOTIMG_RS) $(TRUSTSTORE_RS)
 	@mkdir -p $(BUILD)
 	# Do NOT set RUSTFLAGS here.  The environment variable *overrides*
 	# `[target.x86_64-unknown-none] rustflags` in kernel/.cargo/config.toml,
@@ -158,6 +175,19 @@ $(TEST_EXE): $(ROOT)/test/hello.c
 $(BOOTIMG_RS): $(MBR_BIN) $(STAGE2_BIN) $(TEST_EXE) $(ROOT)/scripts/gen-bootimg.py
 	cd $(ROOT) && $(PYTHON) scripts/gen-bootimg.py \
 	    build/mbr.bin build/stage2.bin build/hello.exe
+
+# --- trust store ------------------------------------------------------------
+# See the definitions near the top of the file for why the list is pruned.
+$(CACERT):
+	@mkdir -p $(BUILD)
+	curl -sS --proto '=https' --max-time 60 -o $@.tmp https://curl.se/ca/cacert.pem
+	mv $@.tmp $@
+
+$(TRUSTSTORE_RS): $(CACERT) $(ROOT)/scripts/gen-truststore.py
+	cd $(ROOT) && TRUST_ROOTS="$(TRUST_ROOTS)" "$(TRUST_PYTHON)" -W ignore \
+	    scripts/gen-truststore.py build/cacert.pem build/truststore.rs
+
+truststore: $(TRUSTSTORE_RS)
 
 # The loader refuses any image it cannot rebase and any import its table does
 # not know.  Both are silent at build time and loud at boot time, and there is

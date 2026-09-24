@@ -76,3 +76,9 @@ QEMU          :=
 QEMU_BIOS_DIR :=
 OVMF_CODE     :=
 OVMF_VARS     :=
+
+# --- trust store generator ---------------------------------------------------
+# It parses certificates with the `cryptography` package, which msys2's python
+# does not ship.  The Windows interpreter on this machine has it.  Quoted in
+# the recipe because the path contains a space.
+TRUST_PYTHON ?= /e/Program Files/Python313/python.exe
