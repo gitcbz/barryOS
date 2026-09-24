@@ -79,3 +79,26 @@ pub fn print_hex(v: u64) {
         }
     }
 }
+
+/// Print `v` in decimal.
+///
+/// Worth having here rather than in each caller: `print_hex` was the only
+/// thing on offer, so several modules grew private decimal printers and the
+/// log ended up mixing "0x1E63 bytes" with "30 seconds" in the same line.
+pub fn print_dec(v: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut n = v;
+    if n == 0 {
+        i -= 1;
+        buf[i] = b'0';
+    }
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    for &b in &buf[i..] {
+        write_byte(b);
+    }
+}

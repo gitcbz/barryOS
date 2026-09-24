@@ -158,6 +158,9 @@ fn reply_to(frame: &[u8]) {
 }
 
 /// Handle one received Ethernet frame.
+///
+/// The receive ring is drained by `net::poll`, which routes by ethertype and
+/// calls this for the ARP ones — this layer does not own the adapter.
 pub fn handle_frame(frame: &[u8]) {
     if frame.len() < 14 {
         return;
@@ -192,23 +195,6 @@ pub fn handle_frame(frame: &[u8]) {
             reply_to(frame);
         }
         _ => {}
-    }
-}
-
-/// Drain the receive ring, handling whatever arrived.
-pub fn poll() {
-    let mut buf = [0u8; e1000::BUF_SIZE];
-    // Bounded: one pass over the ring's worth of descriptors.
-    for _ in 0..e1000::RX_DESC {
-        match e1000::recv_frame(&mut buf) {
-            Some(n) => {
-                serial::print_str("[net] rx frame, ");
-                serial::print_hex(n as u64);
-                serial::print_str(" bytes\n");
-                handle_frame(&buf[..n]);
-            }
-            None => break,
-        }
     }
 }
 
