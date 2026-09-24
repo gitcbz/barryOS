@@ -13,10 +13,12 @@
 //! a string literal has no object to hang methods on until it is used as one.
 
 use alloc::rc::Rc;
+use alloc::vec;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::format;
 
+use super::num;
 use super::interp::{exp_of, ln_of, sqrt_of, Interp};
 use super::value::{self, key_of, Obj, ObjKind, Value};
 
@@ -168,7 +170,7 @@ pub fn install(it: &mut Interp) {
     });
     value::set_prop(&number_ctor, &Rc::from("isInteger"), native(|_, _t, a| {
         match arg(a, 0) {
-            Value::Num(n) => Ok(Value::Bool(n.is_finite() && n.fract() == 0.0)),
+            Value::Num(n) => Ok(Value::Bool(n.is_finite() && num::fract(n) == 0.0)),
             _ => Ok(Value::Bool(false)),
         }
     }, "isInteger"));
@@ -869,7 +871,7 @@ fn install_number(proto: &Value) {
             return Ok(Value::string(format!("{}", n)));
         }
         let scale = powf(10.0, digits as f64);
-        let scaled = (n * scale).round() / scale;
+        let scaled = num::round(n * scale) / scale;
         let text = format!("{:.*}", digits, scaled);
         Ok(Value::string(text))
     }, "toFixed"));
@@ -1038,28 +1040,28 @@ fn nat_console(it: &mut Interp, _t: Value, a: &[Value]) -> R {
 // --- Math ------------------------------------------------------------------
 
 fn nat_abs(_it: &mut Interp, _t: Value, a: &[Value]) -> R {
-    Ok(Value::Num(arg(a, 0).to_number().abs()))
+    Ok(Value::Num(num::abs(arg(a, 0).to_number())))
 }
 fn nat_floor(_it: &mut Interp, _t: Value, a: &[Value]) -> R {
-    Ok(Value::Num(arg(a, 0).to_number().floor()))
+    Ok(Value::Num(num::floor(arg(a, 0).to_number())))
 }
 fn nat_ceil(_it: &mut Interp, _t: Value, a: &[Value]) -> R {
-    Ok(Value::Num(arg(a, 0).to_number().ceil()))
+    Ok(Value::Num(num::ceil(arg(a, 0).to_number())))
 }
 fn nat_round(_it: &mut Interp, _t: Value, a: &[Value]) -> R {
     // JavaScript rounds halves toward positive infinity, not away from zero.
     let n = arg(a, 0).to_number();
-    Ok(Value::Num((n + 0.5).floor()))
+    Ok(Value::Num(num::floor(n + 0.5)))
 }
 fn nat_trunc(_it: &mut Interp, _t: Value, a: &[Value]) -> R {
-    Ok(Value::Num(arg(a, 0).to_number().trunc()))
+    Ok(Value::Num(num::trunc(arg(a, 0).to_number())))
 }
 fn nat_sqrt(_it: &mut Interp, _t: Value, a: &[Value]) -> R {
     Ok(Value::Num(sqrt_of(arg(a, 0).to_number())))
 }
 fn nat_cbrt(_it: &mut Interp, _t: Value, a: &[Value]) -> R {
     let n = arg(a, 0).to_number();
-    let r = powf(n.abs(), 1.0 / 3.0);
+    let r = powf(num::abs(n), 1.0 / 3.0);
     Ok(Value::Num(if n < 0.0 { -r } else { r }))
 }
 fn nat_sign(_it: &mut Interp, _t: Value, a: &[Value]) -> R {
@@ -1152,7 +1154,7 @@ fn sin_of(x: f64) -> f64 {
         return f64::NAN;
     }
     let two_pi = 2.0 * core::f64::consts::PI;
-    let mut r = x - two_pi * (x / two_pi).round();
+    let mut r = x - two_pi * num::round(x / two_pi);
     let pi = core::f64::consts::PI;
     let mut sign = 1.0;
     if r > pi / 2.0 {
@@ -1180,7 +1182,7 @@ fn atan_of(x: f64) -> f64 {
         return if x > 0.0 { core::f64::consts::PI / 2.0 } else { -core::f64::consts::PI / 2.0 };
     }
     let neg = x < 0.0;
-    let x = x.abs();
+    let x = num::abs(x);
     // atan(x) = pi/2 - atan(1/x) for x > 1, which keeps the series converging.
     if x > 1.0 {
         let r = core::f64::consts::PI / 2.0 - atan_series(1.0 / x);
@@ -1213,7 +1215,7 @@ pub fn powf(base: f64, exp: f64) -> f64 {
     if base == 0.0 {
         return 0.0;
     }
-    if base < 0.0 && exp.fract() == 0.0 {
+    if base < 0.0 && num::fract(exp) == 0.0 {
         let r = powf(-base, exp);
         return if (exp as i64) % 2 == 0 { r } else { -r };
     }

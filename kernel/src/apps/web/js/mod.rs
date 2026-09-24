@@ -24,6 +24,7 @@ pub mod builtins;
 pub mod domjs;
 pub mod interp;
 pub mod lexer;
+pub mod num;
 pub mod parser;
 pub mod value;
 

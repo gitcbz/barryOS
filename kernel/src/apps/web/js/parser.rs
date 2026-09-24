@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 use alloc::vec;
 
 use super::ast::{Expr, FnDef, PropKey, Stmt};
+use super::num;
 use super::lexer::{lex, Tok, Token};
 
 pub struct Parser {
@@ -881,7 +882,7 @@ pub fn format_number(v: f64) -> String {
     if v == 0.0 {
         return "0".to_string();
     }
-    if v.fract() == 0.0 && v.abs() < 1e21 {
+    if num::fract(v) == 0.0 && num::abs(v) < 1e21 {
         return alloc::format!("{}", v as i64);
     }
     alloc::format!("{}", v)

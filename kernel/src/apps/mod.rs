@@ -16,6 +16,7 @@ pub mod sysinfo;
 pub mod editor;
 pub mod installer;
 pub mod browser;
+pub mod web;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use crate::serial;

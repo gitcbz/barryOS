@@ -15,6 +15,7 @@
 //! events other than the ones this browser generates.
 
 use alloc::rc::Rc;
+use alloc::vec;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::RefCell;

@@ -20,6 +20,7 @@
 //! because that is what the markup actually says.
 
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use alloc::format;
 

@@ -18,9 +18,11 @@
 //! knows further down the list.
 
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use alloc::format;
 
+use super::js::num;
 use super::dom::Dom;
 
 // ---------------------------------------------------------------------------
@@ -690,7 +692,7 @@ fn length_cells(value: &str, horizontal: bool) -> Option<i32> {
         "" => return None,                             // a bare number is not a length
         _ => return None,
     };
-    Some((number * per_unit).round() as i32)
+    Some(num::round((number * per_unit) as f64) as i32)
 }
 
 fn split_number(v: &str) -> Option<(f32, String)> {
@@ -737,7 +739,7 @@ fn parse_colour(value: &str) -> Option<Rgb> {
         let parts: Vec<i32> = inner
             .split(',')
             .filter_map(|p| p.trim().trim_end_matches('%').parse::<f32>().ok())
-            .map(|f| f.round() as i32)
+            .map(|f| num::round(f as f64) as i32)
             .collect();
         if parts.len() == 3 {
             return Some(Rgb(

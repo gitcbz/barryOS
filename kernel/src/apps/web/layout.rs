@@ -17,6 +17,7 @@
 //! thing CSS could change is where the line breaks fall.
 
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
 

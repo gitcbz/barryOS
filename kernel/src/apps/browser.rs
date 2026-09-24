@@ -12,6 +12,8 @@
 //! then paints whatever state that request is in.  That is why the window
 //! keeps redrawing, and why the pointer keeps moving, while a page loads.
 
+use alloc::string::String;
+use crate::apps::web;
 use crate::dev::keyboard::{
     KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_ENTER, KEY_HOME, KEY_LEFT,
     KEY_PAGE_DOWN, KEY_PAGE_UP, KEY_RIGHT, KEY_UP,
@@ -288,187 +290,157 @@ fn scroll(delta: isize) {
 //  Markup to lines
 // ---------------------------------------------------------------------------
 
-/// Case-insensitive tag-name comparison against a lowercase literal.
-fn tag_is(name: &[u8], want: &[u8]) -> bool {
-    name.len() == want.len()
-        && name.iter().zip(want).all(|(a, b)| a.to_ascii_lowercase() == *b)
+/// Style records, and one index per byte of laid-out text.
+///
+/// The renderer draws from a flat byte buffer, so a style has to be reachable
+/// from a byte offset.  A record is four bytes — three of colour and one of
+/// attributes — and there are at most sixty-four of them on a page, because a
+/// page's text has a handful of appearances rather than thousands.
+const MAX_STYLES: usize = 64;
+static mut STYLE_TAB: [[u8; 4]; MAX_STYLES] = [[0; 4]; MAX_STYLES];
+static mut STYLE_N: usize = 0;
+static mut STYLE_AT: [u8; PAGE_CAP] = [0; PAGE_CAP];
+
+const ATTR_BOLD: u8 = 1;
+const ATTR_ITALIC: u8 = 2;
+const ATTR_UNDERLINE: u8 = 4;
+const ATTR_STRIKE: u8 = 8;
+
+/// The record for a style, made once and shared by every byte that has it.
+fn intern(style: &web::css::Style) -> u8 {
+    let mut rec = [style.color.0, style.color.1, style.color.2, 0u8];
+    if style.bold {
+        rec[3] |= ATTR_BOLD;
+    }
+    if style.italic {
+        rec[3] |= ATTR_ITALIC;
+    }
+    if style.underline {
+        rec[3] |= ATTR_UNDERLINE;
+    }
+    if style.strike {
+        rec[3] |= ATTR_STRIKE;
+    }
+    unsafe {
+        let tab = core::ptr::addr_of!(STYLE_TAB) as *const [u8; 4];
+        for i in 0..STYLE_N {
+            let e = core::ptr::read_volatile(tab.add(i));
+            if e == rec {
+                return i as u8;
+            }
+        }
+        if STYLE_N >= MAX_STYLES {
+            return 0;
+        }
+        let out = core::ptr::addr_of_mut!(STYLE_TAB) as *mut [u8; 4];
+        core::ptr::write_volatile(out.add(STYLE_N), rec);
+        STYLE_N += 1;
+        (STYLE_N - 1) as u8
+    }
 }
 
-/// Turn the fetched body into displayable lines.
+/// The page's URL, as the script sees it.
+fn url_str() -> &'static str {
+    let n = unsafe { URL_LEN };
+    let base = core::ptr::addr_of!(URL) as *const u8;
+    let mut buf = [0u8; MAX_URL];
+    for (i, slot) in buf.iter_mut().enumerate().take(n) {
+        *slot = unsafe { core::ptr::read_volatile(base.add(i)) };
+    }
+    unsafe {
+        URL_VIEW = buf;
+        core::str::from_utf8(&URL_VIEW[..n]).unwrap_or("")
+    }
+}
+static mut URL_VIEW: [u8; MAX_URL] = [0; MAX_URL];
+
+/// Turn the fetched body into displayable lines, with a style per byte.
 ///
-/// The rule is simple: block-level tags end a line, every other tag is
-/// dropped, entities are decoded, and whitespace runs collapse to one space.
-/// Script and style *contents* are dropped too — they are not prose and
-/// showing them would bury the page.
+/// The whole pipeline, in the order a browser runs it: parse the markup, apply
+/// the stylesheets, run the scripts — which may change the tree the layout is
+/// about to read — and lay the result out.  Then everything the pipeline
+/// allocated is handed back, because none of it outlives the copy into the
+/// line tables below and a browser that leaked a document per page would run
+/// out of heap on the fourth one.
 unsafe fn layout() {
-    let body = &raw const PAGE;
-    let body = core::slice::from_raw_parts(body as *const u8, PAGE_LEN);
-    let out = core::ptr::addr_of_mut!(TEXT) as *mut u8;
-    let at = core::ptr::addr_of_mut!(LINE_AT) as *mut u32;
-    let ln = core::ptr::addr_of_mut!(LINE_LEN) as *mut u32;
+    let body = core::slice::from_raw_parts(core::ptr::addr_of!(PAGE) as *const u8, PAGE_LEN);
+    let url = url_str();
 
-    let mut n = 0usize;             // bytes written to TEXT
-    let mut lines = 0usize;         // lines emitted
-    let mut line_start = 0usize;
-    let mut col = 0usize;
-
-    // The word being accumulated.  Wrapping happens *between* words, so a line
-    // never ends in the middle of one.  The first version simply broke at the
-    // column limit, which cut "Avoid use of..." into "Avoid use" and then a
-    // fragment on the next line.
-    let mut word = [0u8; 96];
-    let mut wl = 0usize;
-    let mut pending_space = false;
-
-    macro_rules! end_line {
-        () => {
-            if lines < MAX_LINES && n > line_start {
-                core::ptr::write_volatile(at.add(lines), line_start as u32);
-                core::ptr::write_volatile(ln.add(lines), (n - line_start) as u32);
-                lines += 1;
+    let mark = crate::mem::heap::mark();
+    {
+        let mut page = web::Page::parse(body);
+        for css in FETCHED_CSS.iter().take(unsafe { CSS_COUNT }) {
+            page.css.push(css.clone());
+        }
+        let outcome = page.run_scripts(url);
+        if !outcome.log.is_empty() {
+            serial::print_str("[browser] console: ");
+            serial::print_str(&outcome.log);
+            if !outcome.log.ends_with('\n') {
+                serial::print_str("\n");
             }
-            line_start = n;
-            col = 0;
-            pending_space = false;
-        };
-    }
+        }
+        if let Some(err) = &outcome.error {
+            serial::print_str("[browser] script: ");
+            serial::print_str(err);
+            serial::print_str("\n");
+        }
+        if let Some(target) = outcome.navigate {
+            PENDING_NAV = Some(target);
+        }
 
-    // Place the buffered word, breaking first if it will not fit.
-    macro_rules! flush_word {
-        () => {
-            if wl > 0 && lines < MAX_LINES {
-                let lead = usize::from(pending_space && col > 0);
-                if col + lead + wl > COLS {
-                    end_line!();
-                }
-                if pending_space && col > 0 {
-                    core::ptr::write_volatile(out.add(n), b' ');
-                    n += 1;
-                    col += 1;
-                }
-                for k in 0..wl {
-                    core::ptr::write_volatile(out.add(n), word[k]);
-                    n += 1;
-                }
-                col += wl;
-                wl = 0;
-                pending_space = false;
+        let lines = page.layout(COLS);
+
+        let out = core::ptr::addr_of_mut!(TEXT) as *mut u8;
+        let at = core::ptr::addr_of_mut!(LINE_AT) as *mut u32;
+        let ln = core::ptr::addr_of_mut!(LINE_LEN) as *mut u32;
+        let st = core::ptr::addr_of_mut!(STYLE_AT) as *mut u8;
+        STYLE_N = 0;
+        intern(&web::css::Style::initial());
+
+        let mut n = 0usize;
+        let mut count = 0usize;
+        for line in lines.iter() {
+            if count >= MAX_LINES || n >= PAGE_CAP {
+                break;
             }
-        };
-    }
-
-    // Every byte of text goes through here: whitespace ends the current word
-    // and is remembered as a single separating space, anything else joins the
-    // word.  Bytes below 0x20 that are not whitespace are dropped; bytes at
-    // 0x80 and up are kept, because they are the pieces of a UTF-8 sequence
-    // and removing them would corrupt the character that follows.
-    macro_rules! push_byte {
-        ($b:expr) => {{
-            let b: u8 = $b;
-            if b == b' ' || b == 0x0A || b == 0x0D || b == 0x09 {
-                if wl > 0 {
-                    flush_word!();
-                }
-                if n > line_start {
-                    pending_space = true;
-                }
-            } else if b >= 0x20 && wl < word.len() {
-                word[wl] = b;
-                wl += 1;
-            }
-        }};
-    }
-
-    let mut i = 0usize;
-    while i < body.len() && lines < MAX_LINES && n < PAGE_CAP - 1 {
-        let c = body[i];
-
-        if c == b'<' {
-            // Read the tag name.
-            let mut j = i + 1;
-            let closing = j < body.len() && body[j] == b'/';
-            if closing {
-                j += 1;
-            }
-            let name_start = j;
-            while j < body.len() && (body[j].is_ascii_alphanumeric() || body[j] == b'!') {
-                j += 1;
-            }
-            let name = &body[name_start..j];
-            // Skip to the end of the tag.
-            while j < body.len() && body[j] != b'>' {
-                j += 1;
-            }
-            i = j + 1;
-
-            let eq = |t: &[u8]| tag_is(name, t);
-
-            // Script and style contents are not text.  Skip to the closing tag.
-            if !closing && (eq(b"script") || eq(b"style")) {
-                let close: &[u8] = if eq(b"script") { b"</script" } else { b"</style" };
-                while i + close.len() <= body.len() {
-                    let mut hit = true;
-                    for (a, &b) in close.iter().enumerate() {
-                        if body[i + a].to_ascii_lowercase() != b {
-                            hit = false;
-                            break;
-                        }
-                    }
-                    if hit {
+            let start = n;
+            for run in &line.runs {
+                let code = intern(&run.style);
+                for b in run.text.bytes() {
+                    if n >= PAGE_CAP {
                         break;
                     }
-                    i += 1;
+                    core::ptr::write_volatile(out.add(n), b);
+                    core::ptr::write_volatile(st.add(n), code);
+                    n += 1;
                 }
-                continue;
             }
-
-            // Block-level ends the line; inline is simply dropped.
-            if eq(b"p") || eq(b"br") || eq(b"div") || eq(b"li") || eq(b"tr")
-                || eq(b"ul") || eq(b"ol") || eq(b"table") || eq(b"hr")
-                || eq(b"h1") || eq(b"h2") || eq(b"h3") || eq(b"h4") || eq(b"h5")
-                || eq(b"h6") || eq(b"pre") || eq(b"blockquote") || eq(b"form")
-                || eq(b"section") || eq(b"article") || eq(b"header") || eq(b"footer")
-                || eq(b"title")
-            {
-                flush_word!();
-                end_line!();
-            }
-            continue;
-        }
-
-        if c == b'&' {
-            // A handful of entities, which is all a plain-text view needs.
-            let rest = &body[i..];
-            let (rep, used): (&[u8], usize) = if rest.starts_with(b"&amp;") {
-                (b"&", 5)
-            } else if rest.starts_with(b"&lt;") {
-                (b"<", 4)
-            } else if rest.starts_with(b"&gt;") {
-                (b">", 4)
-            } else if rest.starts_with(b"&quot;") {
-                (b"\"", 6)
-            } else if rest.starts_with(b"&#39;") || rest.starts_with(b"&apos;") {
-                (b"'", 5)
-            } else if rest.starts_with(b"&nbsp;") {
-                (b" ", 6)
+            if n > start {
+                core::ptr::write_volatile(at.add(count), start as u32);
+                core::ptr::write_volatile(ln.add(count), (n - start) as u32);
+                count += 1;
             } else {
-                (b"&", 1)               // unknown: leave it alone
-            };
-            for &b in rep {
-                push_byte!(b);
+                // A blank line is still a line: the blank ones are what
+                // separate a heading from what follows it.
+                core::ptr::write_volatile(at.add(count), n as u32);
+                core::ptr::write_volatile(ln.add(count), 0);
+                count += 1;
             }
-            i += used;
-            continue;
         }
-
-        push_byte!(c);
-        i += 1;
+        LINE_COUNT = count;
+        TOP = 0;
     }
-
-    flush_word!();
-    end_line!();
-    LINE_COUNT = lines;
+    // Everything the pipeline allocated, in one step.  Nothing above is
+    // referenced from here on: what the renderer draws is the copy.
+    crate::mem::heap::reset_to(mark);
 }
+
+/// Stylesheets fetched for this page, and how many.
+static mut FETCHED_CSS: [String; 4] = [const { String::new() }; 4];
+static mut CSS_COUNT: usize = 0;
+/// A navigation a script asked for, to be taken once the layout is done.
+static mut PENDING_NAV: Option<String> = None;
 
 /// Pull the body out of HTTP's receive buffer into ours, the first time the
 /// page is complete.
@@ -581,6 +553,8 @@ fn draw_page(wx: u32, wy: u32) {
     let at = core::ptr::addr_of!(LINE_AT) as *const u32;
     let ln = core::ptr::addr_of!(LINE_LEN) as *const u32;
     let text = core::ptr::addr_of!(TEXT) as *const u8;
+    let sty = core::ptr::addr_of!(STYLE_AT) as *const u8;
+    let tab = core::ptr::addr_of!(STYLE_TAB) as *const [u8; 4];
     let first = unsafe { TOP };
     for row in 0..ROWS {
         let idx = first + row;
@@ -591,13 +565,52 @@ fn draw_page(wx: u32, wy: u32) {
         let len = unsafe { core::ptr::read_volatile(ln.add(idx)) } as usize;
         let mut x = wx + 10;
         let y = top_y + (row as u32) * CH;
-        for k in 0..len {
-            let b = unsafe { core::ptr::read_volatile(text.add(off + k)) };
-            font::draw_char(b, x, y, 0xE8, 0xE8, 0xE8);
-            x += CW;
+        let mut k = 0usize;
+        while k < len {
             if x + CW > wx + WIN_W - 6 {
                 break;
             }
+            let code = unsafe { core::ptr::read_volatile(sty.add(off + k)) } as usize;
+            // A run: every following byte with the same style, drawn with the
+            // same colour and drawn once.
+            let mut run_len = 1usize;
+            while k + run_len < len
+                && unsafe { core::ptr::read_volatile(sty.add(off + k + run_len)) } as usize
+                    == code
+            {
+                run_len += 1;
+            }
+            let rec = if code < MAX_STYLES {
+                unsafe { core::ptr::read_volatile(tab.add(code)) }
+            } else {
+                [0xE8, 0xE8, 0xE8, 0]
+            };
+            for j in 0..run_len {
+                let b = unsafe { core::ptr::read_volatile(text.add(off + k + j)) };
+                if b == b'\t' {
+                    x += CW * 4;
+                    continue;
+                }
+                font::draw_char(b, x, y, rec[0], rec[1], rec[2]);
+                // No bold face and no italic face: the font is one bitmap,
+                // and eight by sixteen pixels has no room to fake either.
+                // Bold is a second pass one pixel across, which is what a
+                // dot-matrix printer did and reads as bold at this size.
+                if rec[3] & ATTR_BOLD != 0 && x + 1 < wx + WIN_W - 6 {
+                    font::draw_char(b, x + 1, y, rec[0], rec[1], rec[2]);
+                }
+                if rec[3] & ATTR_UNDERLINE != 0 {
+                    draw_rect(x, y + CH - 2, CW, 1, (rec[0], rec[1], rec[2]));
+                }
+                if rec[3] & ATTR_STRIKE != 0 {
+                    draw_rect(x, y + CH / 2, CW, 1, (rec[0], rec[1], rec[2]));
+                }
+                x += CW;
+                if x + CW > wx + WIN_W - 6 {
+                    break;
+                }
+            }
+            k += run_len;
         }
     }
 }

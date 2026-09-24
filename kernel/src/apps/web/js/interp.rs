@@ -18,6 +18,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::format;
 
+use super::num;
 use super::ast::{Expr, FnDef, PropKey, Stmt};
 use super::value::{self, key_of, Env, EnvData, Function, Obj, ObjKind, Value};
 
@@ -848,7 +849,7 @@ fn to_int32(v: &Value) -> i64 {
     if !n.is_finite() {
         return 0;
     }
-    let t = if n < 0.0 { -n.floor() } else { n.floor() };
+    let t = if n < 0.0 { -num::floor(-n) } else { num::floor(n) };
     let m = t % 4294967296.0;
     let m = if m < 0.0 { m + 4294967296.0 } else { m };
     (if m >= 2147483648.0 { m - 4294967296.0 } else { m }) as i64
@@ -862,8 +863,8 @@ fn pow(base: f64, exp: f64) -> f64 {
     if base == 0.0 {
         return 0.0;
     }
-    if exp.fract() == 0.0 && exp.abs() < 1024.0 {
-        let mut n = exp.abs() as u32;
+    if num::fract(exp) == 0.0 && num::abs(exp) < 1024.0 {
+        let mut n = num::abs(exp) as u32;
         let mut result = 1.0f64;
         let mut b = base;
         while n > 0 {
@@ -927,7 +928,7 @@ pub fn exp_of(x: f64) -> f64 {
     }
     // x = k ln2 + r, with r small; e^x = 2^k e^r.
     let ln2 = 0.6931471805599453;
-    let k = (x / ln2).round();
+    let k = num::round(x / ln2);
     let r = x - k * ln2;
     let mut term = 1.0;
     let mut sum = 1.0;
@@ -960,7 +961,7 @@ pub fn sqrt_of(x: f64) -> f64 {
     let mut g = x;
     for _ in 0..60 {
         let next = 0.5 * (g + x / g);
-        if (next - g).abs() < 1e-15 * g {
+        if num::abs(next - g) < 1e-15 * g {
             return next;
         }
         g = next;
