@@ -189,12 +189,17 @@ fn begin(url: &str) -> bool {
     // The scheme decides the port and whether the record layer is TLS.  There
     // is no fallback from https to http: a client that quietly downgrades is
     // worse than one that refuses.
+    //
+    // A bare host means https.  Typing "example.com" and sending it in clear
+    // is a decision the user did not make and cannot see, and every site this
+    // browser is meant to reach answers on 443 anyway — the ones that do not
+    // would have answered with a redirect to it.
     let (rest, tls_on) = if let Some(r) = url.strip_prefix("https://") {
         (r, true)
     } else if let Some(r) = url.strip_prefix("http://") {
         (r, false)
     } else {
-        (url, false)
+        (url, true)
     };
     USE_TLS.store(tls_on, Ordering::Relaxed);
 
@@ -228,6 +233,22 @@ fn begin(url: &str) -> bool {
     serial::print_str(host);
     serial::print_str(path);
     serial::print_str("\n");
+
+    // An https fetch is handed to the TLS client whole, and not just because
+    // that is tidier: TLS has to see the connection from the SYN up, since its
+    // handshake keys are bound to the name it resolves and the socket it opens
+    // underneath.  Opening one here as well would leave two SYNs and a client
+    // whose record layer belongs to neither.
+    if tls_on {
+        PHASE.store(phase_to_u8(Phase::Connecting), Ordering::Relaxed);
+        if !tls::start(host, port) {
+            serial::print_str("[http] ");
+            serial::print_str(tls::error());
+            serial::print_str("\n");
+            return fail(4, "[http] could not start the TLS handshake");
+        }
+        return true;
+    }
 
     // An address literal needs no lookup.
     if let Some(ip) = crate::net::arp::parse_ip(host) {
@@ -393,6 +414,9 @@ pub fn tick() {
             if USE_TLS.load(Ordering::Relaxed) { tls::tick(); } else { tcp::tick(); }
             if !HEADERS_PARSED.load(Ordering::Relaxed) {
                 parse_headers();
+                if HEADERS_PARSED.load(Ordering::Relaxed) {
+                    log_receiving();
+                }
             }
             // A redirect is decided as soon as the status and Location are in:
             // there is no point reading the body of a 301, and on a long one
@@ -436,13 +460,41 @@ pub fn tick() {
             ERROR.store(7, Ordering::Relaxed);
             PHASE.store(phase_to_u8(Phase::Failed), Ordering::Relaxed);
             tcp::reset();
+            log_receiving();
             serial::print_str("[http] timed out\n");
         }
     }
 }
 
-fn log_done() {
-    serial::print_str("[http] done: status ");
+/// One line about where a fetch has got to: the status, what length the
+/// headers promised, and how much has arrived.  Printed when the headers are
+/// parsed and again if the whole thing times out — which is the case where it
+/// matters, because "20 seconds, no body" and "20 seconds, body complete but
+/// the connection never closed" are different bugs.
+fn log_receiving() {
+    serial::print_str("[http] status ");
+    serial::print_dec(STATUS.load(Ordering::Relaxed) as u64);
+    serial::print_str(", declared ");
+    serial::print_dec(BODY_DECLARED.load(Ordering::Relaxed) as u64);
+    serial::print_str(", body so far ");
+    serial::print_dec(body_len() as u64);
+    serial::print_str(", wire ");
+    serial::print_dec(rx_len() as u64);
+    if USE_TLS.load(Ordering::Relaxed) {
+        serial::print_str(", tls ");
+        serial::print_str(match crate::crypto::tls::phase() {
+            crate::crypto::tls::Phase::Established => "established",
+            crate::crypto::tls::Phase::Closed => "closed",
+            crate::crypto::tls::Phase::Failed => "failed",
+            crate::crypto::tls::Phase::Handshaking => "handshaking",
+            crate::crypto::tls::Phase::Connecting => "connecting",
+            crate::crypto::tls::Phase::Idle => "idle",
+        });
+    }
+    serial::print_str("\n");
+}
+
+fn log_done() {    serial::print_str("[http] done: status ");
     serial::print_dec(status_code() as u64);
     serial::print_str(", ");
     serial::print_dec(body_len() as u64);
@@ -563,8 +615,14 @@ fn parse_dec(v: &[u8]) -> u64 {
 ///
 /// Location comes in three shapes and all three turn up in the wild: a full
 /// URL, a root-relative path, and a bare relative one.  The last two have to
-/// be resolved against the host we asked for, which is the only part of the
-/// current request worth keeping.
+/// be resolved against the host we asked for — and against the scheme we asked
+/// with, which is why the scheme is not hardcoded here: a relative redirect
+/// from an https page is an https URL, and resolving it to http would take a
+/// page the user reached safely and fetch its next request in clear.
+///
+/// An absolute redirect is followed in either direction except one: https to
+/// http is refused.  Upgrading is what half the web does on the first request;
+/// downgrading is a page deciding to expose the next one.
 fn follow_redirect() {
     let hops = HOPS.fetch_add(1, Ordering::Relaxed) + 1;
     if hops > MAX_HOPS {
@@ -585,6 +643,7 @@ fn follow_redirect() {
     }
     let loc = core::str::from_utf8(&loc[..n]).unwrap_or("");
 
+    let was_tls = USE_TLS.load(Ordering::Relaxed);
     let mut url = [0u8; 384];
     let mut len = 0usize;
     {
@@ -598,18 +657,18 @@ fn follow_redirect() {
             }
         };
         if loc.starts_with("https://") {
-            // Following into TLS would need a TLS client, which does not exist
-            // yet.  Say that rather than silently fetching the plaintext port.
-            ERROR.store(1, Ordering::Relaxed);
-            PHASE.store(phase_to_u8(Phase::Failed), Ordering::Relaxed);
-            tcp::reset();
-            serial::print_str("[http] redirect to https, which is not implemented\n");
-            return;
-        }
-        if loc.starts_with("http://") {
+            push(loc, &mut len);
+        } else if loc.starts_with("http://") {
+            if was_tls {
+                ERROR.store(1, Ordering::Relaxed);
+                PHASE.store(phase_to_u8(Phase::Failed), Ordering::Relaxed);
+                tcp::reset();
+                serial::print_str("[http] refusing to downgrade to http\n");
+                return;
+            }
             push(loc, &mut len);
         } else {
-            push("http://", &mut len);
+            push(if was_tls { "https://" } else { "http://" }, &mut len);
             let mut host = [0u8; 128];
             let hn = target_into(&mut host);
             push(core::str::from_utf8(&host[..hn]).unwrap_or(""), &mut len);
@@ -627,7 +686,6 @@ fn follow_redirect() {
     serial::print_str(target);
     serial::print_str("\n");
 
-    tcp::reset();
     begin(target);
 }
 

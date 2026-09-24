@@ -232,12 +232,92 @@ fn selftest() {
         return;
     }
     serial::print_str("[net] self-test: ok (ICMP, ARP, UDP, DHCP, DNS)\n");
+
+    serial::print_str("[net] self-test: pinging 1.1.1.1 (off-subnet)\n");
+    let mut far = false;
+    for _ in 0..4 {
+        if icmp::request([1, 1, 1, 1], 7) {
+            let start = crate::interrupts::TIMER_TICKS.load(Ordering::Relaxed);
+            while crate::interrupts::TIMER_TICKS.load(Ordering::Relaxed)
+                .saturating_sub(start) < 100
+            {
+                poll();
+                if icmp::take_reply().is_some() {
+                    far = true;
+                    break;
+                }
+            }
+        }
+        if far {
+            break;
+        }
+    }
+    serial::print_str(if far {
+        "[net] self-test: 1.1.1.1 answered\n"
+    } else {
+        "[net] self-test: 1.1.1.1 did not answer\n"
+    });
+
+    selftest_https();
 }
 
-/// The name the boot self-test resolves.  Small, plain, and reliably there.
+/// The last and largest self-test: a whole https page, at boot, where the log
+/// can show it.
+///
+/// Everything below the browser is invisible until something asks it to work
+/// — and the only other things that ask are a human typing and clicking.  A
+/// handshake that fails is the kind of thing that should be said out loud on
+/// the way up, not discovered later, and this is the one path where "it works"
+/// is a claim about the kernel, the adapter, the network and a real server all
+/// at once.
+///
+/// It is one request, to a name chosen for being small and reliably there.  A
+/// machine with no DHCP answer never reaches it, and one whose gateway does not
+/// answer ICMP skips it, so the cost falls only on machines that have a working
+/// network and are about to use it.
+fn selftest_https() {
+    let url = SELFTEST_URL;
+    serial::print_str("[net] self-test: an https fetch of ");
+    serial::print_str(url);
+    serial::print_str("\n");
+    if !http::start(url) {
+        serial::print_str("[net] self-test: could not start the fetch\n");
+        return;
+    }
+    let start = crate::interrupts::TIMER_TICKS.load(Ordering::Relaxed);
+    while http::in_progress()
+        && crate::interrupts::TIMER_TICKS.load(Ordering::Relaxed)
+            .saturating_sub(start) < HTTPS_SELFTEST_TICKS
+    {
+        poll();
+    }
+    if http::phase() == http::Phase::Done {
+        serial::print_str("[net] self-test: https ok, status ");
+        serial::print_dec(http::status_code() as u64);
+        serial::print_str(", ");
+        serial::print_dec(http::body_len() as u64);
+        serial::print_str(" body bytes, ");
+        serial::print_dec(http::hops() as u64);
+        serial::print_str(" redirect(s)\n");
+    } else {
+        serial::print_str("[net] self-test: https failed: ");
+        serial::print_str(http::phase_name());
+        serial::print_str(" — ");
+        serial::print_str(http::error());
+        serial::print_str("\n");
+    }
+}
+
+/// The name the boot self-test fetches.  Small, plain, and reliably there.
 /// It is a test target, not a "home page" — the browser's default is whatever
 /// the user types.
 const SELFTEST_NAME: &str = "example.com";
+const SELFTEST_URL: &str = "https://example.com/";
+
+/// How long the boot fetch may take, in PIT ticks.  30 seconds: a TLS
+/// handshake to a server on the other side of the world is a second or two,
+/// and anything past this is a machine with no route out.
+const HTTPS_SELFTEST_TICKS: u64 = 3000;
 
 /// Poll the stack for `ticks` PIT ticks.
 fn spin(ticks: u64) {

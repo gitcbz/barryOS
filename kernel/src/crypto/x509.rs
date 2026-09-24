@@ -66,6 +66,30 @@ pub struct Cert<'a> {
     pub san: &'a [u8],
 }
 
+impl<'a> Cert<'a> {
+    /// An empty certificate, for building one up field by field.
+    ///
+    /// `verify_signed_by` reads only the issuer's key — its algorithm, its
+    /// curve and the key itself — so a certificate assembled from a stored
+    /// SubjectPublicKeyInfo and nothing else is a perfectly good stand-in for
+    /// a root whose real certificate never arrived.
+    pub const EMPTY: Cert<'a> = Cert {
+        tbs: &[],
+        sig_alg: &[],
+        sig_alg_full: &[],
+        signature: &[],
+        issuer: &[],
+        subject: &[],
+        not_before: 0,
+        not_after: 0,
+        key_alg: &[],
+        curve: &[],
+        key: &[],
+        is_ca: false,
+        san: &[],
+    };
+}
+
 /// Parse one certificate.
 pub fn parse(der_bytes: &[u8]) -> Option<Cert<'_>> {
     let cert = der::parse_one(der_bytes)?;

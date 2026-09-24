@@ -163,19 +163,6 @@ impl RsaPublic {
         Some(out)
     }
 
-    /// The recovered encoded message, for the self-test to print when a
-    /// verification fails.  Not used by any verification path.
-    pub fn debug_recover(&self, sig: &[u8], out: &mut [u8]) -> bool {
-        match self.recover(sig) {
-            Some(em) => {
-                let n = out.len().min(self.modulus_bytes());
-                out[..n].copy_from_slice(&em[..n]);
-                true
-            }
-            None => false,
-        }
-    }
-
     /// PKCS#1 v1.5: 0x00 0x01 FF..FF 0x00 || DigestInfo.
     ///
     /// The padding check is not optional and the whole structure is compared:
@@ -360,29 +347,6 @@ pub fn selftest() -> usize {
 
     // And the two that must fail.  A verifier that accepts everything passes
     // every test above.
-    {
-        // Print what the signature actually decodes to.  Without this, "it
-        // returned false" says nothing about which half is wrong.
-        let mut sig = [0u8; 256];
-        unhex(v::RSA_PKCS1_SHA256_SIG, &mut sig);
-        let mut em = [0u8; 256];
-        let got = key.debug_recover(&sig, &mut em);
-        crate::serial::print_str("[crypto]   debug em: ok=");
-        crate::serial::print_dec(got as u64);
-        crate::serial::print_str(" head ");
-        for i in 0..12 {
-            crate::serial::print_hex(em[i] as u64);
-            crate::serial::print_str(" ");
-        }
-        crate::serial::print_str("tail ");
-        for i in 224..236 {
-            crate::serial::print_hex(em[i] as u64);
-            crate::serial::print_str(" ");
-        }
-        crate::serial::print_str("
-");
-    }
-
     {
         let mut sig = [0u8; 256];
         unhex(v::RSA_PKCS1_SHA256_SIG_TAMPERED, &mut sig);
