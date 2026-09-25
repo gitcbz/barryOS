@@ -38,15 +38,17 @@ jobs:
             clang lld binutils-mingw-w64-x86-64 gcc-mingw-w64-x86-64 \
             python3 file xxd
           # The trust store generator parses certificates, so it needs
-          # `cryptography`; nothing else in the build uses Python packages.
-          python3 -m pip install --user --break-system-packages cryptography
+          # `cryptography`; the image checker decodes with a decoder nobody
+          # here wrote, so it needs `Pillow`.  Nothing in the build itself uses
+          # a Python package.
+          python3 -m pip install --user --break-system-packages cryptography pillow
           nasm -v
           xorriso --version | head -1
           qemu-img --version | head -1
           clang --version | head -1
           x86_64-w64-mingw32-ld --version | head -1
           x86_64-w64-mingw32-gcc --version | head -1
-          python3 -c "import cryptography; print(cryptography.__version__)"
+          python3 -c "import cryptography, PIL; print(cryptography.__version__)"
 
       - name: Install Rust nightly
         run: |
@@ -64,6 +66,13 @@ jobs:
 
       - name: Build kernel, images, ISO and VMDKs
         run: make all vmdk
+
+      - name: Host test suites
+        # No hypervisor and no kernel toolchain: the page renderer, the image
+        # decoders and the TLS client, each against something that was not
+        # written here.  The build above already produced the trust store the
+        # TLS vectors need.
+        run: make host-tests
 
       - name: Inspect the artifacts
         # Cheap structural checks, so a build that produced a file of the wrong

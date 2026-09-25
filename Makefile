@@ -332,6 +332,14 @@ clippy:
 check:
 	bash $(ROOT)/scripts/check.sh
 
+# Everything that can be verified without a kernel toolchain and without a
+# boot: the page renderer, the image decoders and the TLS client.  The parts
+# they cover cannot be checked from the outside — a page that renders slightly
+# wrong and a picture that decodes to nearly the right colours both look like
+# working software from a screenshot.
+host-tests:
+	bash $(ROOT)/tests/run-host-tests.sh
+
 clean:
 	rm -rf $(BUILD)
 	rm -rf $(KERN_DIR)/target
