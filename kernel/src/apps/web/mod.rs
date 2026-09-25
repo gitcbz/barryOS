@@ -1,18 +1,20 @@
-//! Rendering a web page: markup, stylesheet and script.
+//! Rendering a web page: markup, stylesheet, script and picture.
 //!
-//! Three layers, each of which can be read and tested on its own:
+//! Layers, each of which can be read and tested on its own:
 //!
 //!   dom     bytes to a document tree
 //!   css     stylesheets, and which rules apply to which elements
-//!   layout  a document with computed styles to lines of styled characters
 //!   js      the page's scripts, and the little DOM they are given to change
+//!   img     JPEG, PNG, GIF and BMP to pixels
+//!   layout  a document with computed styles to lines of styled characters
 //!
-//! None of this draws.  It produces the lines; `browser` puts them on screen,
-//! and keeping the two apart is what makes the interesting part testable
-//! without a framebuffer.
+//! None of this draws.  `layout` produces the lines and `img` produces the
+//! pixels; `browser` puts them on screen, and keeping the two apart is what
+//! makes the interesting part testable without a framebuffer.
 
 pub mod css;
 pub mod dom;
+pub mod img;
 pub mod js;
 pub mod layout;
 
@@ -242,14 +244,40 @@ impl Page {
         js::run(self.dom.clone(), &self.scripts, href)
     }
 
-    /// Lay the document out at a given width.
+    /// Lay the document out at a given width, with no pictures.
     pub fn layout(&self, cols: usize) -> Vec<layout::Line> {
+        self.layout_with(cols, &layout::NoImages)
+    }
+
+    /// Lay the document out, asking `imgs` where the pictures are.
+    pub fn layout_with(&self, cols: usize, imgs: &dyn layout::ImageSource) -> Vec<layout::Line> {
         let sheets: Vec<String> = self
             .inline_css()
             .into_iter()
             .chain(self.css.iter().cloned())
             .collect();
         let styles = css::Stylesheet::parse_all(&sheets);
-        layout::layout(&self.dom.borrow(), &styles, cols)
+        layout::layout_with(&self.dom.borrow(), &styles, cols, imgs)
+    }
+
+    /// Every `<img src>` in the document, in document order and without
+    /// repeats.
+    ///
+    /// Read after the scripts have run rather than before: a page that draws
+    /// its own content has no pictures in its markup at all, and asking the
+    /// document as it stands is the only way to see the ones it built.
+    pub fn image_urls(&self) -> Vec<String> {
+        let d = self.dom.borrow();
+        let mut out: Vec<String> = Vec::new();
+        for &id in &d.by_tag("img") {
+            let Some(src) = d.attr(id, "src") else { continue };
+            if src.is_empty() || src.starts_with("data:") {
+                continue;
+            }
+            if !out.iter().any(|u| u == src) {
+                out.push(String::from(src));
+            }
+        }
+        out
     }
 }

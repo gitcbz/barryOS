@@ -12,9 +12,17 @@
 //! order, which is what a text browser has always done and is still a page
 //! you can read.
 //!
-//! Every line is a list of runs, so a line can be half bold and half not.
-//! That is what makes a stylesheet visible at all: without runs, the only
-//! thing CSS could change is where the line breaks fall.
+//! Every line is a list of runs, so a line can be half bold and half not, and
+//! each run carries its own link, so a line can hold three links and only the
+//! right one is clickable.  Both are what makes a stylesheet and a hyperlink
+//! visible at all: without runs the only thing CSS could change is where the
+//! lines break, and without per-run links the only thing that could be
+//! clicked is whichever link happens to come first.
+//!
+//! Pictures are here too but their pixels are not: layout asks a caller for
+//! the size to draw one at, in character cells, and records which slot the
+//! pixels are in.  That keeps a decoder — and a framebuffer — out of a module
+//! whose whole job is deciding where things go.
 
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -24,19 +32,60 @@ use core::ops::Range;
 use super::css::{self, Align, Display, Style, WhiteSpace};
 use super::dom::{Dom, Kind};
 
-/// A stretch of characters that share a style.
+/// A stretch of characters that share a style and a destination.
 #[derive(Clone, Debug)]
 pub struct Run {
     pub text: String,
     pub style: Style,
+    /// Where clicking this run goes, for a run that is inside an `<a href>`.
+    pub link: Option<String>,
+}
+
+impl Run {
+    pub fn new(text: &str, style: &Style) -> Run {
+        Run { text: text.to_string(), style: style.clone(), link: None }
+    }
+}
+
+/// A picture, placed on a line of its own.
+#[derive(Clone, Debug)]
+pub struct ImageBox {
+    /// The caller's handle for the pixels, from `ImageSource::resolve`.
+    pub slot: usize,
+    /// The reference, so a renderer can say what it could not draw.
+    pub src: String,
+    /// How many character cells to draw it in.
+    pub cols: usize,
+    pub rows: usize,
+}
+
+/// What the layout needs from whoever owns the pictures.
+///
+/// Layout deals in character cells and nothing else, so it asks for a size in
+/// cells rather than in pixels: only the caller knows how large a glyph is and
+/// how wide the window is.  An implementation that has not decoded anything —
+/// the host test, and any page with no pictures — says no, and the `alt` text
+/// appears instead.
+pub trait ImageSource {
+    /// The slot holding this picture's pixels, and the size to draw it at.
+    fn resolve(&self, src: &str, avail_cols: usize) -> Option<(usize, usize, usize)>;
+}
+
+/// An `ImageSource` for callers that have no pictures at all.
+pub struct NoImages;
+
+impl ImageSource for NoImages {
+    fn resolve(&self, _src: &str, _avail: usize) -> Option<(usize, usize, usize)> {
+        None
+    }
 }
 
 /// One line of the page.
 #[derive(Clone, Debug, Default)]
 pub struct Line {
     pub runs: Vec<Run>,
-    /// The first link on the line, for a renderer that can click it.
-    pub link: Option<String>,
+    /// Set instead of runs when this line is a picture.
+    pub image: Option<ImageBox>,
     /// Character cells of blank space before the text, from indentation.
     pub indent: usize,
     pub align: Align,
@@ -52,26 +101,44 @@ impl Line {
     }
 
     pub fn is_blank(&self) -> bool {
-        self.runs.iter().all(|r| r.text.trim().is_empty())
+        self.image.is_none() && self.runs.iter().all(|r| r.text.trim().is_empty())
     }
 
     /// Where the text stops, in character cells.
     pub fn width(&self) -> usize {
         self.runs.iter().map(|r| r.text.chars().count()).sum()
     }
+
+    /// The first link on the line, for callers that want one answer.
+    pub fn link(&self) -> Option<&str> {
+        self.runs.iter().find_map(|r| r.link.as_deref())
+    }
 }
 
-/// Lay out a document at a given width in character cells.
+/// Lay out a document at a given width in character cells, with no pictures.
 pub fn layout(dom: &Dom, sheet: &css::Stylesheet, cols: usize) -> Vec<Line> {
+    layout_with(dom, sheet, cols, &NoImages)
+}
+
+/// Lay out a document, asking `imgs` about any picture it contains.
+pub fn layout_with(
+    dom: &Dom,
+    sheet: &css::Stylesheet,
+    cols: usize,
+    imgs: &dyn ImageSource,
+) -> Vec<Line> {
     let styles = css::compute(dom, sheet);
     let mut b = Builder {
         dom,
         styles: &styles,
+        imgs,
         lines: Vec::new(),
         current: Line::default(),
         col: 0,
         cols: cols.max(16),
         pending_space: false,
+        pending_link: None,
+        link: None,
     };
     // The document's own children: `<html>`, and whatever is inside it.
     let root = dom.root;
@@ -86,11 +153,18 @@ pub fn layout(dom: &Dom, sheet: &css::Stylesheet, cols: usize) -> Vec<Line> {
 struct Builder<'a> {
     dom: &'a Dom,
     styles: &'a [Style],
+    imgs: &'a dyn ImageSource,
     lines: Vec<Line>,
     current: Line,
     col: usize,
     cols: usize,
     pending_space: bool,
+    /// The link the *pending* space belongs to.  A space between two anchors
+    /// is not inside either of them, and giving it to the one that follows
+    /// makes clicking the gap follow a link the reader did not aim at.
+    pending_link: Option<String>,
+    /// The `<a href>` the text being placed is inside, if any.
+    link: Option<String>,
 }
 
 impl<'a> Builder<'a> {
@@ -141,10 +215,7 @@ impl<'a> Builder<'a> {
             let width = self.cols.saturating_sub(style.indent.max(0) as usize);
             let mut line = Line { align: Align::Left, ..Default::default() };
             line.indent = style.indent.max(0) as usize;
-            line.runs.push(Run {
-                text: "-".repeat(width.min(72).max(1)),
-                style: style.clone(),
-            });
+            line.runs.push(Run::new(&"-".repeat(width.min(72).max(1)), style));
             self.lines.push(line);
             for _ in 0..style.space_after {
                 self.blank_line();
@@ -241,9 +312,11 @@ impl<'a> Builder<'a> {
             while padded.chars().count() < each {
                 padded.push(' ');
             }
-            line.runs.push(Run { text: padded, style: cell_style });
+            // A column is one clickable unit even when its cell held a link,
+            // because the padding would otherwise become part of the target.
+            line.runs.push(Run::new(&padded, &cell_style));
             if i + 1 < n {
-                line.runs.push(Run { text: "  ".to_string(), style: style.clone() });
+                line.runs.push(Run::new("  ", style));
             }
         }
         self.lines.push(line);
@@ -256,7 +329,7 @@ impl<'a> Builder<'a> {
             return;
         }
         match self.dom.kind(id) {
-            Kind::Text(t) => out.push(Run { text: t.clone(), style }),
+            Kind::Text(t) => out.push(Run::new(t, &style)),
             Kind::Element { .. } => {
                 for &c in &self.dom.node(id).children {
                     self.flatten(c, out);
@@ -268,16 +341,15 @@ impl<'a> Builder<'a> {
 
     fn inline(&mut self, id: usize, style: &Style) {
         let tag = self.dom.tag(id).unwrap_or("");
-        let link = if tag == "a" { self.dom.attr(id, "href") } else { None };
         match tag {
             "br" => {
                 self.end_line();
                 return;
             }
             "img" => {
+                let src = self.dom.attr(id, "src").unwrap_or("");
                 let alt = self.dom.attr(id, "alt").unwrap_or("");
-                if !alt.is_empty() {
-                    let text = alloc::format!("[{}]", alt);
+                if let Some(text) = self.picture(src, alt) {
                     self.push_run(&text, style);
                 }
                 return;
@@ -329,18 +401,53 @@ impl<'a> Builder<'a> {
             _ => {}
         }
 
-        let outer_link = self.current.link.clone();
-        if let Some(href) = link {
-            if self.current.link.is_none() {
-                self.current.link = Some(String::from(href));
+        let outer_link = self.link.clone();
+        if tag == "a" {
+            if let Some(href) = self.dom.attr(id, "href") {
+                // A nested anchor does not replace the one it is inside; the
+                // outer one is what the reader sees the text belong to.
+                if self.link.is_none() {
+                    self.link = Some(String::from(href));
+                }
             }
         }
         for &c in &self.dom.node(id).children {
             self.block_or_inline(c);
         }
-        // A child's link does not leak to the rest of the line.
-        if link.is_some() {
-            self.current.link = outer_link;
+        if tag == "a" {
+            self.link = outer_link;
+        }
+    }
+
+    /// A picture, as a line of its own, or as its `alt` text.
+    ///
+    /// Returns the text to use when the caller cannot supply the pixels.  A
+    /// picture on a line of its own is a compromise — HTML puts it in the flow
+    /// of the text — and it is the compromise that costs nothing here: an
+    /// inline picture would make a screen row stand for part of a line, and
+    /// every loop that walks the lines would have to know about it.
+    fn picture(&mut self, src: &str, alt: &str) -> Option<String> {
+        let avail = self.cols.saturating_sub(self.current.indent);
+        if let Some((slot, cols, rows)) = self.imgs.resolve(src, avail) {
+            self.end_line();
+            let mut line = Line {
+                indent: self.current.indent,
+                align: Align::Left,
+                ..Default::default()
+            };
+            line.image = Some(ImageBox {
+                slot,
+                src: String::from(src),
+                cols: cols.max(1),
+                rows: rows.max(1),
+            });
+            self.lines.push(line);
+            return None;
+        }
+        if alt.is_empty() {
+            None
+        } else {
+            Some(alloc::format!("[{}]", alt))
         }
     }
 
@@ -376,15 +483,20 @@ impl<'a> Builder<'a> {
                 // is "a b".
                 let leading = text.starts_with(|c: char| c.is_whitespace());
                 let trailing = text.ends_with(|c: char| c.is_whitespace());
-                self.pending_space |= leading;
+                if leading {
+                    self.pending_space = true;
+                    self.pending_link = self.link.clone();
+                }
                 for word in text.split_ascii_whitespace() {
                     self.push_word(word, &style);
                     // Words inside one text node are separated by the
                     // whitespace that split them, whatever the node does at
                     // its edges.
                     self.pending_space = true;
+                    self.pending_link = self.link.clone();
                 }
                 self.pending_space = trailing;
+                self.pending_link = self.link.clone();
             }
         }
     }
@@ -400,36 +512,42 @@ impl<'a> Builder<'a> {
             self.end_line();
         }
         if self.pending_space && self.col > 0 {
-            self.push_run_raw(" ", style);
+            let sep = self.pending_link.take();
+            self.push_run_raw(" ", style, sep.as_deref());
         }
-        self.push_run_raw(word, style);
+        let link = self.link.clone();
+        self.push_run_raw(word, style, link.as_deref());
         self.pending_space = false;
     }
 
     fn push_run(&mut self, text: &str, style: &Style) {
-        self.push_run_raw(text, style);
+        let link = self.link.clone();
+        self.push_run_raw(text, style, link.as_deref());
         self.pending_space = false;
     }
 
-    fn push_run_raw(&mut self, text: &str, style: &Style) {
+    fn push_run_raw(&mut self, text: &str, style: &Style, link: Option<&str>) {
         if text.is_empty() {
             return;
         }
         self.col += text.chars().count();
-        // Merge with the previous run when the style is the same, so a
-        // paragraph of one colour does not become one run per word.
+        // Merge with the previous run when the style *and* the destination are
+        // the same, so a paragraph of one colour does not become one run per
+        // word and two adjacent links do not become one link.
         if let Some(last) = self.current.runs.last_mut() {
-            if last.style == *style {
+            if last.style == *style && last.link.as_deref() == link {
                 last.text.push_str(text);
                 return;
             }
         }
-        self.current.runs.push(Run { text: text.to_string(), style: style.clone() });
+        self.current.runs.push(Run {
+            text: text.to_string(),
+            style: style.clone(),
+            link: link.map(alloc::string::String::from),
+        });
     }
 
     fn end_line(&mut self) {
-        if self.col != 0 {
-        }
         if !self.current.runs.is_empty() {
             let line = core::mem::take(&mut self.current);
             self.lines.push(line);
@@ -437,6 +555,7 @@ impl<'a> Builder<'a> {
         self.current = Line::default();
         self.col = 0;
         self.pending_space = false;
+        self.pending_link = None;
     }
 
     fn blank_line(&mut self) {
