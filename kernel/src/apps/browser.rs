@@ -64,7 +64,15 @@ const PAPER: (u8, u8, u8) = (0xFA, 0xF9, 0xF5);
 /// `wy + 26` while the field was *drawn* from `wy+20` to `wy+40`, so clicking
 /// the address bar almost always landed in the page.
 const TOOLBAR_H: u32 = 28;
+/// The toolbar's own left margin, the width of each of the two buttons, and
+/// the gap between a button and the text in the field.  Named because the
+/// drawing and the click test both use them and they must not drift: the same
+/// mistake, made twice before, put the boundary of the address field eight
+/// pixels from where the field was drawn, so a click on the first character
+/// landed on the second.
+const TOOLBAR_X: u32 = 4;
 const BUTTON_W: u32 = 22;
+const FIELD_PAD: u32 = 4;
 /// Below it: where the fetch got to.
 const STATUS_H: u32 = 22;
 
@@ -400,13 +408,15 @@ pub fn on_click(px: u32, py: u32) -> bool {
     let rel_y = py as i32 - wy as i32;
     if rel_y < (TITLE_BAR_H + TOOLBAR_H) as i32 {
         let rel_x = (px as i32 - wx as i32).max(0) as u32;
-        if rel_x < BUTTON_W {
+        let field_x = TOOLBAR_X + 2 * BUTTON_W;
+        if (TOOLBAR_X..TOOLBAR_X + BUTTON_W).contains(&rel_x) {
             back();
-        } else if rel_x < 2 * BUTTON_W {
+        } else if (TOOLBAR_X + BUTTON_W..field_x).contains(&rel_x) {
             forward();
-        } else {
+        } else if rel_x >= field_x + FIELD_PAD {
             // Clamp the caret to the text that is actually there.
-            let col = ((rel_x - 2 * BUTTON_W) as usize / CW as usize).min(unsafe { URL_LEN });
+            let col = ((rel_x - field_x - FIELD_PAD) as usize / CW as usize)
+                .min(unsafe { URL_LEN });
             unsafe { CARET = col; }
         }
         return true;
@@ -1715,20 +1725,20 @@ fn draw_toolbar(wx: u32, wy: u32) {
     // cannot do without and the one thing here that a keyboard has no key
     // for, because this machine's keyboard has no modifiers to spare.
     let (at, n) = unsafe { (HIST_AT, HIST_N) };
-    draw_button(wx + 4, y, '<', n > 0 && at > 0);
-    draw_button(wx + 4 + BUTTON_W, y, '>', at + 1 < n);
+    draw_button(wx + TOOLBAR_X, y, '<', n > 0 && at > 0);
+    draw_button(wx + TOOLBAR_X + BUTTON_W, y, '>', at + 1 < n);
 
-    let field_x = wx + 4 + 2 * BUTTON_W;
-    let field_w = WIN_W - 8 - 2 * BUTTON_W;
+    let field_x = wx + TOOLBAR_X + 2 * BUTTON_W;
+    let field_w = WIN_W - 2 * TOOLBAR_X - 2 * BUTTON_W;
     draw_rect(field_x, y, field_w, 20, (0x1E, 0x28, 0x3C));
 
     let raw = url_bytes();
-    let cols = ((field_w - 8) / CW) as usize;
+    let cols = ((field_w - 2 * FIELD_PAD) / CW) as usize;
     // Scroll the text so the caret is always visible: a URL longer than the
     // field used to be drawn off the right edge with the caret gone with it.
     let caret = unsafe { CARET };
     let first = caret.saturating_sub(cols.saturating_sub(1));
-    let mut x = field_x + 4;
+    let mut x = field_x + FIELD_PAD;
     let ty = y + 2;
     for i in first..raw.len().min(first + cols) {
         let here = i == caret;
