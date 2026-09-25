@@ -160,6 +160,19 @@ pub fn body_len() -> usize {
     rx_len().saturating_sub(body_offset())
 }
 
+/// Did the response not all fit?
+///
+/// A page that was cut off is a page that reads as though it ended there, so
+/// the one thing worth doing about it is saying so — otherwise the reader
+/// blames the site rather than the browser.
+pub fn body_truncated() -> bool {
+    if USE_TLS.load(Ordering::Relaxed) {
+        tls::truncated()
+    } else {
+        tcp::rx_truncated()
+    }
+}
+
 /// Copy part of the body out of the receive buffer.
 pub fn read_body(offset: usize, out: &mut [u8]) -> usize {
     rx_read_at(body_offset() + offset, out)
@@ -499,16 +512,22 @@ fn log_done() {    serial::print_str("[http] done: status ");
     serial::print_str(", ");
     serial::print_dec(body_len() as u64);
     serial::print_str(" bytes of body");
-    if tcp::rx_truncated() {
+    if body_truncated() {
         serial::print_str(" (truncated: receive buffer full)");
     }
     serial::print_str("\n");
 }
 
 
+/// How much of the response is examined for its headers.  Headers are a few
+/// hundred bytes on a real server and the largest anyone has ever seen is a
+/// few kilobytes of cookies; this is generous, and it is a *stack* array,
+/// which is why it is not simply the size of the receive buffer.
+const HEADER_SCAN: usize = 8 * 1024;
+
 /// Find the end of the headers and pick out the fields worth keeping.
 fn parse_headers() {
-    let mut all = [0u8; tcp::RX_CAP];
+    let mut all = [0u8; HEADER_SCAN];
     let n = rx_read_at(0, &mut all);
     if n < 12 {
         return;                                 // wait for more

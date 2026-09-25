@@ -148,7 +148,7 @@ static SERVER_SEQ: AtomicU32 = AtomicU32::new(0);
 /// buffer to fit whatever it is handed does not get to choose its own size.
 /// `truncated` says when that happened, so the page is shown as the first part
 /// of something rather than as the whole of it.
-const RX_CAP: usize = 32 * 1024;
+const RX_CAP: usize = 256 * 1024;
 static mut RX: [u8; RX_CAP] = [0; RX_CAP];
 static RX_LEN: AtomicU32 = AtomicU32::new(0);
 static RX_TRUNCATED: AtomicBool = AtomicBool::new(false);

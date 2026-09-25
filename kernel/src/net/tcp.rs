@@ -23,7 +23,7 @@ const MAX_SEG: usize = 1460;
 
 /// Receive buffer.  A page that does not fit is truncated and the truncation
 /// is reported rather than silently swallowed.
-pub const RX_CAP: usize = 32 * 1024;
+pub const RX_CAP: usize = 256 * 1024;
 
 const RETRY_TICKS: u64 = 100;           // one second at 100 Hz
 const MAX_RETRIES: u32 = 5;
