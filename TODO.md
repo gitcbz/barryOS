@@ -3,11 +3,38 @@
 Ordered by dependency: things near the top unblock things below them.
 `[x]` = done and verified, `[ ]` = outstanding, `[~]` = partly done, see the note.
 
-Last reconciled against the code: 2026-09-22.
+Last reconciled against the code: 2026-09-25.
 
 ---
 
 ## Recently completed
+
+### Links, history and pictures
+- [x] **Per-run links** (`layout::Run::link`) — every run carries its own
+  destination, so a line with three links has three clickable targets and the
+  space between two of them belongs to neither.  The browser draws link runs
+  in a link colour and resolves a click through a screen row and column.
+- [x] **History** — 24 addresses in a fixed-size ring, no heap.  Back and
+  forward buttons in the toolbar; a link someone clicked is a new place, and a
+  redirect is the same navigation arriving somewhere else, so one pushes and
+  the other replaces.
+- [x] **Pictures** — decoded, kept in a three-megabyte arena, drawn at a size
+  the layout asked for in character cells.  A picture that will not decode, or
+  that the arena has no room for, shows its `alt` text and says why in the log.
+- [x] **The load order** — document, then stylesheets and scripts, then the
+  scripts run, then the pictures.  Pictures come last because a script can add
+  one; laying out before the stylesheets arrive would show the page twice,
+  once wrong.  Steps 2–4 skip themselves when a page has nothing to fetch.
+
+### Buffers, and saying when they run out
+- [x] **The transport receive buffers are 256 KiB**, up from 32, and the
+  document buffer with them.  The old limit was the reason a long page was cut
+  off, and it was invisible: a page that ends early reads as a page that ends.
+- [x] **Truncation is reported** — a line at the end of the text and a marker
+  in the status bar, because the one thing worse than showing half a page is
+  showing half a page as though it were all of it.
+- [x] **Subresources: deduplicated, 8 stylesheets and 16 scripts, 1 MiB
+  between them**, fetched in the order the markup named them.
 
 ### The page renderer
 - [x] **HTML5 parser** (`apps/web/dom.rs`) — implicit `html`/`head`/`body`,
@@ -265,10 +292,21 @@ Kept here so the delta is visible; older rounds are in CHANGELOG.md.
 - [ ] **Widget toolkit** — buttons and a dock exist as ad-hoc drawing, not as a
   reusable control library. No menus, scrollbars, list views or text fields.
 - [ ] **Screenshot tool and image viewer** (planned in ARCHITECTURE.md).
-- [ ] **Browser: no links, no history, no images** — the renderer now knows
-  which line a link is on (see `layout::Line::link`) but nothing draws it as
-  clickable, there is no back button, and an `<img>` shows its `alt` text
-  rather than a picture.  No image decoder exists.
+- [x] **Image decoding** (`apps/web/img/`) — PNG at every colour type and bit
+  depth including Adam7 interlacing, over a DEFLATE decompressor written from
+  the specification; baseline *and* progressive JPEG, because every JPEG this
+  was tested against came back progressive; GIF, BMP and ICO.  Verified
+  against Pillow, `tests/check-images.py`, on 44 generated cases plus real
+  pictures from the target sites.  WebP and AVIF are not here and will not be:
+  both are built on video codecs.
+- [ ] **Pictures are placed, not floated** — an `<img>` gets a line of its own
+  rather than flowing with the text around it, because an inline picture would
+  make a screen row stand for part of a line and every loop that walks the
+  lines would have to know.
+- [ ] **Browser: no forward/back keyboard shortcut** — the two toolbar buttons
+  work and the history is a ring of 24, but this machine's keyboard has no
+  modifiers to spare, so there is no `Alt+Left`.
+- [ ] **No forms, no find-in-page, no download, no bookmarks, no tabs.**
 - [ ] **Script arguments** — `run script a b` does not pass `$1`/`$2` through.
 - [ ] **`su` has no logout / no session lock**, and there is no way to change a
   password.
