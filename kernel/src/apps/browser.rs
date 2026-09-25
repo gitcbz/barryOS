@@ -1303,6 +1303,13 @@ pub fn selftest(url: &str) -> usize {
         failures += 1;
     } else {
         serial::print_str("[browser]   ok   the page became lines\n");
+        // The last line as well as the first four.  A page that was cut off
+        // says so on its last line, and that is the one claim about a page
+        // that cannot be checked by looking at the start of it.
+        unsafe { print_line(lines - 1) };
+    }
+    if unsafe { DOC_TRUNCATED } {
+        serial::print_str("[browser]   --   the server sent more than this browser holds\n");
     }
 
     // A link that cannot be found by clicking is a link that is drawn and not
@@ -1350,6 +1357,30 @@ pub fn selftest(url: &str) -> usize {
     }
     set_url(HOME);
     failures
+}
+
+/// One laid-out line, as the log shows it.
+unsafe fn print_line(i: usize) {
+    if i >= LINE_COUNT {
+        return;
+    }
+    if core::ptr::read_volatile((core::ptr::addr_of!(LINE_IMG) as *const u16).add(i)) != 0 {
+        serial::print_str("[browser]   | (picture)
+");
+        return;
+    }
+    let off = core::ptr::read_volatile((core::ptr::addr_of!(LINE_AT) as *const u32).add(i)) as usize;
+    let len = core::ptr::read_volatile((core::ptr::addr_of!(LINE_LEN) as *const u32).add(i)) as usize;
+    let base = core::ptr::addr_of!(TEXT) as *const u8;
+    let mut text = [0u8; 110];
+    let n = len.min(110);
+    for (k, slot) in text.iter_mut().enumerate().take(n) {
+        *slot = core::ptr::read_volatile(base.add(off + k));
+    }
+    serial::print_str("[browser]   | ");
+    serial::print_str(core::str::from_utf8(&text[..n]).unwrap_or(""));
+    serial::print_str("
+");
 }
 
 /// The picture path on its own, over a real picture.
@@ -1546,6 +1577,14 @@ fn intern(style: &web::css::Style) -> u8 {
     }
 }
 
+/// Room kept back at the end of the text buffer for the truncation notice.
+///
+/// The notice is appended after the page has been copied, and the page it
+/// most needs to appear on is the one that filled the buffer — so the buffer
+/// has to be full *before* the last few hundred bytes, or the one case that
+/// matters is the one case that cannot be reported.
+const NOTICE_RESERVE: usize = 192;
+
 /// Copy laid-out lines into the flat buffers the renderer draws from.
 ///
 /// One byte of text is one character cell, which is what makes the hit test
@@ -1566,10 +1605,13 @@ unsafe fn copy_lines(lines: &[web::layout::Line]) {
     LINK_FROM[0] = 0;
     intern(&web::css::Style::initial());
 
+    // One line and one notice's worth of room held back.
+    let room = PAGE_CAP.saturating_sub(NOTICE_RESERVE);
+
     let mut n = 0usize;
     let mut count = 0usize;
     for line in lines {
-        if count >= MAX_LINES || n >= PAGE_CAP {
+        if count + 1 >= MAX_LINES || n >= room {
             break;
         }
         let start = n;
@@ -1585,7 +1627,7 @@ unsafe fn copy_lines(lines: &[web::layout::Line]) {
         // Indentation is part of the line, at the front, where the renderer
         // would otherwise have to remember to skip it.
         for _ in 0..line.indent {
-            if n >= PAGE_CAP {
+            if n >= room {
                 break;
             }
             core::ptr::write_volatile(out.add(n), b' ');
@@ -1601,14 +1643,14 @@ unsafe fn copy_lines(lines: &[web::layout::Line]) {
                 None => 0,
             };
             for b in run.text.bytes() {
-                if n >= PAGE_CAP {
+                if n >= room {
                     break;
                 }
                 // A tab is four cells everywhere else in this file; it is
                 // four cells here too, or the columns stop matching.
                 let cells = if b == b'\t' { 4 } else { 1 };
                 for _ in 0..cells {
-                    if n >= PAGE_CAP {
+                    if n >= room {
                         break;
                     }
                     core::ptr::write_volatile(out.add(n), if b == b'\t' { b' ' } else { b });
