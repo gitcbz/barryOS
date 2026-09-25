@@ -4,6 +4,8 @@
 //! - `framebuffer`: linear framebuffer graphics (pixel plotting, rects, text).
 //! - `keyboard`:    PS/2 keyboard (scancode → ASCII, 64-key queue).
 //! - `mouse`:       PS/2 mouse (IRQ12, 3-byte packets) + framebuffer cursor.
+//! - `ps2`:         the 8042 controller both of them hang off, and its
+//!                  configuration byte.
 //! - `pci`:         PCI bus enumeration (everything non-legacy needs this).
 //! - `serial` lives in `serial.rs` — working since before this stage.
 //!
@@ -15,6 +17,7 @@ pub mod framebuffer;
 pub mod keyboard;
 pub mod mouse;
 pub mod pci;
+pub mod ps2;
 pub mod ata;
 
 use core::sync::atomic::{AtomicBool, Ordering};

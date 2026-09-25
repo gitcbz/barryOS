@@ -175,6 +175,12 @@ pub unsafe extern "C" fn rust_main(boot_info: usize) -> ! {
         input_loop();
     }
 
+    // The keyboard, asked to prove itself before anyone is asked to type on
+    // it.  A machine that boots to a login prompt it cannot be typed into is
+    // indistinguishable from a working one until somebody tries, and by then
+    // the evidence is a person saying "the keyboard does not work".
+    let _keyboard_faults = dev::keyboard::selftest();
+
     // Login.  Nothing on the desktop is reachable until someone authenticates,
     // and the uid it returns is what the whole session then runs as.
     serial::print_str("[boot] handing over to the login screen\n");

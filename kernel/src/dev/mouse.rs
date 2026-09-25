@@ -10,12 +10,11 @@
 //! area underneath.
 
 use crate::dev::framebuffer;
+use crate::dev::ps2;
 use crate::serial;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 
-const PS2_DATA:   u16 = 0x60;
-const PS2_STATUS: u16 = 0x64;
-const PS2_CMD:    u16 = 0x64;
+use crate::dev::ps2::{DATA as PS2_DATA, STATUS as PS2_STATUS};
 
 /// Cursor bitmap: 12 columns x 19 rows, MSB = leftmost of 12 bits.
 const CURSOR_W: u32 = 12;
@@ -93,17 +92,14 @@ pub fn take_dirty() -> bool {
 /// Initialise the auxiliary PS/2 port and start the mouse reporting.
 pub fn init() {
     unsafe {
-        // 1. Enable the auxiliary device (the mouse port).
-        ctrl_write(0xA8);
+        // 1. Enable the auxiliary device (the mouse port).  The controller's
+        //    configuration byte — IRQ12 among its bits — belongs to the
+        //    keyboard driver, which writes it once and knows what it wrote.
+        ps2::ctrl_write(0xA8);
 
-        // 2. Controller configuration byte: enable IRQ12, un-block the aux
-        //    clock (bit 5 is "disable"), and enable the aux port itself.
-        ctrl_write(0x20);
-        let mut cb = data_read();
-        cb |= 0x02;      // IRQ12 on
-        cb &= !0x20;     // aux clock enabled
-        ctrl_write(0x60);
-        data_write(cb);
+        // 2. Anything the controller said before we asked it anything is
+        //    about to be read as though it were the mouse's answer.
+        ps2::drain_output();
 
         // 3. Device: reset defaults (0xF6) then enable data reporting (0xF4).
         //    Each is answered with 0xFA; anything else means no mouse.
@@ -126,11 +122,24 @@ pub fn init() {
 pub fn handle_irq() {
     IRQS.fetch_add(1, Ordering::Relaxed);
 
-    let (status, byte) = unsafe { (port_in(PS2_STATUS), port_in(PS2_DATA)) };
-    // Bit 0 = output buffer full, bit 5 = the byte came from the aux port.
-    if status & 0x01 == 0 || status & 0x20 == 0 {
+    // The status is read *before* the byte, and the byte only once it is known
+    // to be the mouse's.  Both devices share one output buffer, and reading it
+    // takes the byte out of it for good: a handler that reads first and checks
+    // afterwards destroys whatever was there.  A keyboard byte in this buffer
+    // is a keystroke that nobody will ever see again, because by the time the
+    // keyboard's own interrupt arrives the byte it was going to read is gone.
+    let status = unsafe { ps2::status() };
+    if status & ps2::ST_OUTPUT_FULL == 0 {
+        return;                              // a spurious IRQ12, nothing waiting
+    }
+    if status & ps2::ST_FROM_AUX == 0 {
+        // The keyboard's byte, delivered to the mouse's interrupt — which is
+        // what `keyboard.allowBothIRQs` in a VMware configuration asks for.
+        // It is still the keyboard's byte, so it goes to the keyboard.
+        crate::dev::keyboard::handle_scancode(unsafe { ps2::read_data() });
         return;
     }
+    let byte = unsafe { ps2::read_data() };
 
     let cycle = CYCLE.load(Ordering::Relaxed);
     // Byte 0 always has bit 3 set; use it to resync if we ever fall out of step.
@@ -250,69 +259,9 @@ fn blit(x: i32, y: i32) {
     }
 }
 
-// ---------------------------------------------------------------------------
-//  8042 controller access
-// ---------------------------------------------------------------------------
-
-/// Send a byte to the controller (not the device).
-unsafe fn ctrl_write(v: u8) {
-    wait_input_clear();
-    port_out(PS2_CMD, v);
-}
-
-/// Send a byte on the data port (to the device, after a 0xD4 command).
-unsafe fn data_write(v: u8) {
-    wait_input_clear();
-    port_out(PS2_DATA, v);
-}
-
-unsafe fn data_read() -> u8 {
-    wait_output_full();
-    port_in(PS2_DATA)
-}
-
 /// Send a command byte to the mouse and check for its 0xFA ack.
 unsafe fn mouse_cmd(b: u8) -> bool {
-    ctrl_write(0xD4);          // "next data byte goes to the aux device"
-    data_write(b);
-    data_read() == 0xFA
-}
-
-/// Bounded waits: a dead or absent controller must not hang the boot.
-unsafe fn wait_input_clear() {
-    for _ in 0..100_000 {
-        if port_in(PS2_STATUS) & 0x02 == 0 {
-            return;
-        }
-    }
-}
-
-unsafe fn wait_output_full() {
-    for _ in 0..100_000 {
-        if port_in(PS2_STATUS) & 0x01 != 0 {
-            return;
-        }
-    }
-}
-
-#[inline]
-unsafe fn port_in(port: u16) -> u8 {
-    let val: u8;
-    core::arch::asm!(
-        "in al, dx",
-        out("al") val,
-        in("dx") port,
-        options(nostack, nomem, preserves_flags),
-    );
-    val
-}
-
-#[inline]
-unsafe fn port_out(port: u16, val: u8) {
-    core::arch::asm!(
-        "out dx, al",
-        in("dx") port,
-        in("al") val,
-        options(nostack, nomem, preserves_flags),
-    );
+    ps2::ctrl_write(0xD4);     // "the next data byte goes to the aux device"
+    ps2::data_write(b);
+    ps2::data_read() == 0xFA
 }

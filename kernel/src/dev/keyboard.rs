@@ -8,6 +8,7 @@
 //! wrote the result to the serial port, and threw it away — nothing in the
 //! kernel ever consumed a keystroke, so the desktop could not be typed into.
 
+use crate::dev::ps2;
 use crate::serial;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -109,7 +110,99 @@ pub fn init() {
     KEYS_TOTAL.store(0, Ordering::SeqCst);
     SHIFT_DOWN.store(false, Ordering::SeqCst);
     CAPS_ON.store(false, Ordering::SeqCst);
+    unsafe { configure_controller() };
     serial::print_str("[kb] PS/2 keyboard driver initialized (shift+caps, 64-key queue)\n");
+}
+
+/// Turn the keyboard's interrupt on, and be sure it is the keyboard's.
+///
+/// The configuration byte belongs to the controller and governs both devices:
+/// bit 0 is the keyboard's interrupt, bit 1 the mouse's, bit 4 disables the
+/// keyboard's clock, bit 5 the mouse's.  Reading it is a command like any
+/// other, so whatever is already in the output buffer has to be drained first
+/// — otherwise the "configuration byte" that comes back is the last scancode
+/// or acknowledgement, and writing *that* back is how a machine ends up with
+/// a working mouse and a dead keyboard.  Around half of all scancodes have
+/// bit 4 set, and bit 4 of the configuration byte is the keyboard's clock.
+///
+/// The mouse's bit is set here rather than in the mouse driver because the
+/// byte can only be written by one of them, and the keyboard's driver is the
+/// one that has to be sure the keyboard works.
+unsafe fn configure_controller() {
+    ps2::drain_output();
+    ps2::ctrl_write(0x20);                      // "read configuration byte"
+    let before = ps2::data_read();
+    let after = (before | 0x03) & !0x30;        // IRQ1 and IRQ12 on, no clock off
+    ps2::ctrl_write(0x60);                      // "write configuration byte"
+    ps2::data_write(after);
+    serial::print_str("[kb] controller config 0x");
+    serial::print_hex(before as u64);
+    serial::print_str(" -> 0x");
+    serial::print_hex(after as u64);
+    serial::print_str("\n");
+}
+
+/// Prove that a keystroke would reach this driver.
+///
+/// Nothing else can.  Whether a key arrives depends on the controller's
+/// interrupt being enabled, the PIC line being unmasked, the IDT entry being
+/// present, the handler reading the right port and the decoder recognising the
+/// scancode — five things in four subsystems, and a boot has no fingers to
+/// test them with.  So the controller is asked to deliver a scancode as though
+/// one had been typed (command 0xD2, "put the next data byte in the output
+/// buffer") and this driver is then asked whether it saw it.
+///
+/// The key is taken back out of the queue before returning, so nothing is
+/// typed into anything — including any key the reader pressed while the
+/// machine was booting, which would otherwise appear in the login prompt as
+/// something they did not type.
+///
+/// Returns the number of checks that failed; every boot prints the result.
+pub fn selftest() -> usize {
+    const PROBE: u8 = 0x1E;                     // the scancode for the A key
+    let before = KEYS_TOTAL.load(Ordering::Relaxed);
+
+    unsafe {
+        ps2::drain_output();
+        ps2::ctrl_write(0xD2);
+        ps2::data_write(PROBE);
+    }
+
+    // A handful of timer ticks: the interrupt is delivered within microseconds
+    // and the wait is only here so that a missing one is a report rather than
+    // a hang.  The PIT runs at 100 Hz.
+    let start = crate::interrupts::TIMER_TICKS.load(Ordering::Relaxed);
+    while crate::interrupts::TIMER_TICKS.load(Ordering::Relaxed).saturating_sub(start) < 5
+        && KEYS_TOTAL.load(Ordering::Relaxed) == before
+    {
+    }
+
+    let seen = KEYS_TOTAL.load(Ordering::Relaxed) - before;
+
+    // Whatever is in the queue is not the reader's, so it goes.
+    while poll().is_some() {}
+
+    serial::print_str("[kb] self-test: scancode delivered to the driver");
+    if seen == 0 {
+        serial::print_str(" -- FAIL, the interrupt never arrived\n");
+        return 1;
+    }
+    serial::print_str(" (");
+    serial::print_dec(seen as u64);
+    serial::print_str(" interrupt(s))\n");
+    0
+}
+
+/// How many scancodes the controller has delivered since boot.
+pub fn total() -> u64 {
+    KEYS_TOTAL.load(Ordering::Relaxed) as u64
+}
+
+/// How many decoded keys are waiting to be read.
+pub fn queued() -> usize {
+    let head = Q_HEAD.load(Ordering::Acquire);
+    let tail = Q_TAIL.load(Ordering::Acquire);
+    (tail + QUEUE_SIZE - head) % QUEUE_SIZE
 }
 
 /// Process a scancode.  Called from the IRQ1 handler.

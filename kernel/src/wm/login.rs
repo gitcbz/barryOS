@@ -148,13 +148,35 @@ pub fn run() -> u32 {
     set_message("default passwords are the account names", DIM);
     draw();
 
+    // A login prompt nobody can type into is indistinguishable, from the
+    // outside, from one nobody has typed into yet — and the difference matters
+    // enormously to whoever is sitting in front of it.  So: after a few
+    // seconds with no keystroke at all, say so, once.  Silence after that
+    // means the reader has not typed; this line means their typing is not
+    // reaching the machine, which is a different problem with a different
+    // answer.
+    let opened = interrupts::TIMER_TICKS.load(Ordering::Relaxed);
+    let mut warned = false;
+
     loop {
         let Some(key) = keyboard::poll() else {
+            if !warned
+                && interrupts::TIMER_TICKS.load(Ordering::Relaxed).saturating_sub(opened)
+                    > 500
+                && keyboard::total() == 0
+            {
+                warned = true;
+                serial::print_str(
+                    "[login] no keystroke has reached this machine yet -- if one has been
+                     [login] typed, the keyboard is not getting through to the guest
+");
+            }
             // Idle until the next interrupt; the PIT wakes us 100 times a
             // second, which is plenty for a keyboard poll.
             unsafe { core::arch::asm!("hlt", options(nostack, nomem, preserves_flags)) };
             continue;
         };
+        warned = true;
 
         match key {
             keyboard::KEY_TAB => unsafe {
