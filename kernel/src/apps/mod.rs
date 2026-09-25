@@ -171,4 +171,18 @@ pub fn run_selftest() {
         serial::print_dec(failures as u64);
         serial::print_str(" check(s) FAILED\n");
     }
+
+    // And then the whole browser, over a real site, because the four layers
+    // above can all pass and the load order between them still be wrong — and
+    // a load order that is wrong shows up as a page that reads slightly
+    // oddly, which is not a thing anyone reports.
+    serial::print_str("[apps] step 6: browser self-test\n");
+    let n = browser::selftest(browser::SELFTEST_URL);
+    if n == 0 {
+        serial::print_str("[browser] all checks pass\n");
+    } else {
+        serial::print_str("[browser] ");
+        serial::print_dec(n as u64);
+        serial::print_str(" check(s) FAILED\n");
+    }
 }
